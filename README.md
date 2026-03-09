@@ -5,6 +5,7 @@ uv sync
 export $GEMINI_API_KEY="your_gemini_api_key"
 wget https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
 unzip https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+uv pip install vosk
 ```
 
 ### examples
