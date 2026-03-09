@@ -1,0 +1,714 @@
+"""
+## Documentation
+Quickstart:
+https://github.com/google-gemini/cookbook/blob/main/quickstarts/Get_started_LiveAPI.py
+
+## Setup
+pip install google-genai opencv-python pyaudio pillow mss vosk pyttsx3
+"""
+
+import argparse
+import asyncio
+import base64
+import contextlib
+import datetime as dt
+import io
+import json
+import logging
+import os
+import re
+import traceback
+from pathlib import Path
+
+import cv2
+import pyaudio
+import PIL.Image
+
+from google import genai
+from google.genai import errors
+from google.genai import types
+
+try:
+    import pyttsx3
+except ImportError:
+    pyttsx3 = None
+
+try:
+    import vosk
+except ImportError:
+    vosk = None
+
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+SEND_SAMPLE_RATE = 16000
+RECEIVE_SAMPLE_RATE = 24000
+CHUNK_SIZE = 1024
+
+MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+DEFAULT_MODE = "camera"
+DEFAULT_WAKE_WORD = "gemini"
+DEFAULT_EXIT_WORD = "see you"
+DEFAULT_STT_MODEL_PATH = "./models/vosk-model-small-en-us-0.15"
+LOG_DIR = Path("./logs")
+
+RECOVERABLE_ERROR_PATTERNS = (
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "deadline",
+    "internal",
+    "rate limit",
+    "resource exhausted",
+    "server",
+    "service unavailable",
+    "temporarily unavailable",
+    "timeout",
+    "unavailable",
+)
+
+client = None
+
+# ===== ここを好きに書き換えてOK（あなたのロールプレイ設定）=====
+AUTO_START_PROMPT = (
+    "You are an American exchange student living in Japan. "
+    "You are talking to your roommate in English. "
+    "You are friendly, talkative, and kind. "
+    "You really want to share something surprising that happened yesterday. "
+    "If you hear incorrect English, gently correct it (briefly) and continue naturally. "
+    "Start speaking first now and keep the conversation going."
+)
+
+# LiveConnectConfig（system_instruction は role='system' が安定しやすいです）
+CONFIG = types.LiveConnectConfig(
+    response_modalities=["AUDIO"],
+    media_resolution="MEDIA_RESOLUTION_MEDIUM",
+    speech_config=types.SpeechConfig(
+        voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
+        )
+    ),
+    realtime_input_config=types.RealtimeInputConfig(
+        turn_coverage="TURN_INCLUDES_ALL_INPUT"
+    ),
+    context_window_compression=types.ContextWindowCompressionConfig(
+        trigger_tokens=25600,
+        sliding_window=types.SlidingWindow(target_tokens=12800),
+    ),
+    system_instruction=types.Content(
+        parts=[
+            types.Part.from_text(
+                text="Follow the user's roleplay setup. Keep responses natural and conversational."
+            )
+        ],
+        role="system",
+    ),
+)
+
+pya = pyaudio.PyAudio()
+
+
+def normalize_phrase(text):
+    lowered = text.lower()
+    normalized = re.sub(r"[^a-z0-9\s]", " ", lowered)
+    return " ".join(normalized.split())
+
+
+def phrase_in_text(phrase, text):
+    if not phrase or not text:
+        return False
+    phrase_tokens = phrase.split()
+    text_tokens = text.split()
+    window = len(phrase_tokens)
+    if window == 0 or window > len(text_tokens):
+        return False
+    return any(text_tokens[i : i + window] == phrase_tokens for i in range(len(text_tokens) - window + 1))
+
+
+def list_input_devices():
+    """PyAudioの入力デバイス一覧を表示"""
+    for i in range(pya.get_device_count()):
+        info = pya.get_device_info_by_index(i)
+        if info.get("maxInputChannels", 0) > 0:
+            name = info.get("name", "unknown")
+            rate = int(info.get("defaultSampleRate", 0))
+            chans = int(info.get("maxInputChannels", 0))
+            print(f"{i}: {name} (inputs={chans}, defaultRate={rate})")
+
+
+def configure_logging():
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_DIR / f"{dt.date.today().isoformat()}.log"
+    logger = logging.getLogger("speak")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+
+def get_client():
+    global client
+    if client is None:
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is not set.")
+        client = genai.Client(
+            http_options={"api_version": "v1beta"},
+            api_key=api_key,
+        )
+    return client
+
+
+def iter_response_parts(response):
+    if (
+        not response.server_content
+        or not response.server_content.model_turn
+        or not response.server_content.model_turn.parts
+    ):
+        return []
+    return response.server_content.model_turn.parts
+
+
+class LocalSpeaker:
+    def __init__(self, logger):
+        self.logger = logger
+        self.available = pyttsx3 is not None
+
+    def _speak_blocking(self, text):
+        engine = pyttsx3.init()
+        engine.say(text)
+        engine.runAndWait()
+        engine.stop()
+
+    async def speak(self, text):
+        if not self.available:
+            self.logger.warning("TTS unavailable: pyttsx3 is not installed.")
+            return
+        try:
+            await asyncio.to_thread(self._speak_blocking, text)
+        except Exception as exc:  # pragma: no cover - environment dependent
+            self.logger.warning("TTS failed: %s", exc)
+
+
+class LocalCommandDetector:
+    def __init__(self, model_path, wake_word, exit_word, logger, cooldown_seconds=1.5):
+        if vosk is None:
+            raise RuntimeError("vosk is required. Install it with `pip install vosk`.")
+
+        resolved = Path(model_path)
+        if not resolved.exists():
+            raise RuntimeError(
+                f"Vosk model not found at {resolved}. Set --stt-model-path or VOSK_MODEL_PATH."
+            )
+
+        self.logger = logger
+        self.wake_word = normalize_phrase(wake_word)
+        self.exit_word = normalize_phrase(exit_word)
+        self.cooldown_seconds = cooldown_seconds
+        self.last_trigger_at = {"wake": 0.0, "exit": 0.0}
+        self.model = vosk.Model(str(resolved))
+        self.recognizer = vosk.KaldiRecognizer(self.model, SEND_SAMPLE_RATE)
+        self.recognizer.SetWords(False)
+
+    def _should_emit(self, command, now):
+        last = self.last_trigger_at.get(command, 0.0)
+        if now - last < self.cooldown_seconds:
+            return False
+        self.last_trigger_at[command] = now
+        return True
+
+    def _extract_text(self, payload):
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return ""
+        return normalize_phrase(data.get("text") or data.get("partial") or "")
+
+    def _match_command(self, text):
+        now = asyncio.get_running_loop().time()
+        if phrase_in_text(self.exit_word, text) and self._should_emit("exit", now):
+            return "exit"
+        if phrase_in_text(self.wake_word, text) and self._should_emit("wake", now):
+            return "wake"
+        return None
+
+    def feed(self, pcm_bytes):
+        payloads = []
+        if self.recognizer.AcceptWaveform(pcm_bytes):
+            payloads.append(self.recognizer.Result())
+        else:
+            payloads.append(self.recognizer.PartialResult())
+
+        for payload in payloads:
+            text = self._extract_text(payload)
+            if not text:
+                continue
+            command = self._match_command(text)
+            if command is None:
+                continue
+            self.logger.info("Detected %s phrase from transcript=%r", command, text)
+            if hasattr(self.recognizer, "Reset"):
+                self.recognizer.Reset()
+            return command
+        return None
+
+
+class AudioLoop:
+    def __init__(
+        self,
+        video_mode=DEFAULT_MODE,
+        auto_start=True,
+        enable_text_input=True,
+        mic_index=None,
+        strict_turns=False,
+        wake_word=DEFAULT_WAKE_WORD,
+        exit_word=DEFAULT_EXIT_WORD,
+        wake_word_enabled=True,
+        stt_model_path=DEFAULT_STT_MODEL_PATH,
+    ):
+        self.video_mode = video_mode
+        self.auto_start = auto_start
+        self.enable_text_input = enable_text_input
+        self.mic_index = mic_index
+        self.strict_turns = strict_turns
+        self.wake_word_enabled = wake_word_enabled
+
+        self.logger = configure_logging()
+        self.speaker = LocalSpeaker(self.logger)
+        self.detector = LocalCommandDetector(
+            model_path=stt_model_path,
+            wake_word=wake_word,
+            exit_word=exit_word,
+            logger=self.logger,
+        )
+
+        self.audio_stream = None
+        self.session = None
+        self.audio_in_queue = None
+        self.out_queue = None
+        self.session_task = None
+        self.session_stop_event = None
+        self.input_task = None
+        self.assistant_speaking = False
+        self.running = True
+        self.state = "idle"
+        self.control_queue = asyncio.Queue()
+
+    def _set_state(self, new_state):
+        if self.state == new_state:
+            return
+        self.logger.info("state %s -> %s", self.state, new_state)
+        print(f"[state] {self.state} -> {new_state}")
+        self.state = new_state
+
+    async def _announce(self, text, level="info"):
+        getattr(self.logger, level)("%s", text)
+        print(text)
+        await self.speaker.speak(text)
+
+    def _get_frame(self, cap):
+        ret, frame = cap.read()
+        if not ret:
+            return None
+
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = PIL.Image.fromarray(frame_rgb)
+        img.thumbnail([1024, 1024])
+
+        image_io = io.BytesIO()
+        img.save(image_io, format="jpeg")
+        image_io.seek(0)
+
+        image_bytes = image_io.read()
+        return {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode()}
+
+    async def get_frames(self):
+        cap = await asyncio.to_thread(cv2.VideoCapture, 0)
+        try:
+            while self.running and self.state == "active":
+                frame = await asyncio.to_thread(self._get_frame, cap)
+                if frame is None:
+                    break
+
+                await asyncio.sleep(1.0)
+
+                if self.out_queue is not None and not (
+                    self.strict_turns and self.assistant_speaking
+                ):
+                    await self.out_queue.put(frame)
+        finally:
+            cap.release()
+
+    def _get_screen(self):
+        try:
+            import mss  # pylint: disable=g-import-not-at-top
+        except ImportError as exc:
+            raise ImportError("Please install mss package using 'pip install mss'") from exc
+
+        sct = mss.mss()
+        monitor = sct.monitors[0]
+        shot = sct.grab(monitor)
+
+        image_bytes = mss.tools.to_png(shot.rgb, shot.size)
+        img = PIL.Image.open(io.BytesIO(image_bytes))
+
+        image_io = io.BytesIO()
+        img.save(image_io, format="jpeg")
+        image_io.seek(0)
+
+        image_bytes = image_io.read()
+        return {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode()}
+
+    async def get_screen(self):
+        while self.running and self.state == "active":
+            frame = await asyncio.to_thread(self._get_screen)
+            if frame is None:
+                break
+
+            await asyncio.sleep(1.0)
+
+            if self.out_queue is not None and not (
+                self.strict_turns and self.assistant_speaking
+            ):
+                await self.out_queue.put(frame)
+
+    async def send_realtime(self):
+        while self.running and self.state == "active":
+            if self.out_queue is None:
+                await asyncio.sleep(0.01)
+                continue
+            msg = await self.out_queue.get()
+            if self.session is not None:
+                await self.session.send(input=msg)
+
+    async def receive_audio(self):
+        try:
+            while self.running and self.state == "active":
+                if self.session is None:
+                    await asyncio.sleep(0.01)
+                    continue
+
+                turn = self.session.receive()
+                async for response in turn:
+                    for part in iter_response_parts(response):
+                        if part.inline_data and isinstance(part.inline_data.data, bytes):
+                            self.assistant_speaking = True
+                            if self.audio_in_queue is not None:
+                                self.audio_in_queue.put_nowait(part.inline_data.data)
+                            continue
+                        if isinstance(part.text, str) and not getattr(part, "thought", False):
+                            print(part.text, end="")
+
+                self.assistant_speaking = False
+                if not self.strict_turns and self.audio_in_queue is not None:
+                    while not self.audio_in_queue.empty():
+                        self.audio_in_queue.get_nowait()
+        except Exception as exc:
+            if self._is_normal_session_close(exc):
+                self.logger.info("receive_audio closed normally: %s", exc)
+                return
+            raise
+
+    async def play_audio(self):
+        stream = await asyncio.to_thread(
+            pya.open,
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=RECEIVE_SAMPLE_RATE,
+            output=True,
+        )
+        try:
+            while self.running and self.state == "active":
+                if self.audio_in_queue is None:
+                    await asyncio.sleep(0.01)
+                    continue
+                bytestream = await self.audio_in_queue.get()
+                await asyncio.to_thread(stream.write, bytestream)
+        finally:
+            await asyncio.to_thread(stream.close)
+
+    async def listen_microphone(self):
+        if self.mic_index is None:
+            mic_info = pya.get_default_input_device_info()
+            mic_index = mic_info["index"]
+        else:
+            mic_index = self.mic_index
+
+        self.audio_stream = await asyncio.to_thread(
+            pya.open,
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=SEND_SAMPLE_RATE,
+            input=True,
+            input_device_index=mic_index,
+            frames_per_buffer=CHUNK_SIZE,
+        )
+
+        kwargs = {"exception_on_overflow": False} if __debug__ else {}
+
+        while self.running:
+            data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
+
+            command = self.detector.feed(data)
+            if command == "wake":
+                if self.state == "idle":
+                    await self.control_queue.put(("wake", "voice"))
+            elif command == "exit":
+                await self.control_queue.put(("sleep", "voice"))
+
+            if self.out_queue is not None and self.state == "active" and not (
+                self.strict_turns and self.assistant_speaking
+            ):
+                await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
+
+    async def send_text(self):
+        while self.running:
+            text = await asyncio.to_thread(input, "message > ")
+            normalized = normalize_phrase(text)
+            if normalized == "q":
+                await self.control_queue.put(("quit", "text"))
+                return
+            if self.state == "idle" and normalized == self.detector.wake_word:
+                await self.control_queue.put(("wake", "text"))
+                continue
+            if self.state in {"connecting", "active"} and normalized == self.detector.exit_word:
+                await self.control_queue.put(("sleep", "text"))
+                continue
+            if self.session is not None and self.state == "active":
+                while self.strict_turns and self.assistant_speaking:
+                    await asyncio.sleep(0.05)
+                await self.session.send(input=text or ".", end_of_turn=True)
+
+    def _is_recoverable_gemini_error(self, exc):
+        message = normalize_phrase(str(exc))
+        return any(pattern in message for pattern in RECOVERABLE_ERROR_PATTERNS)
+
+    def _is_normal_session_close(self, exc):
+        if isinstance(exc, asyncio.CancelledError):
+            return True
+        if isinstance(exc, errors.APIError) and getattr(exc, "code", None) == 1000:
+            return True
+        message = normalize_phrase(str(exc))
+        return message in {"1000 none", "1000 ok"} or "connection closed ok" in message
+
+    async def _report_session_error(self, exc):
+        message = str(exc).strip() or exc.__class__.__name__
+        if self._is_recoverable_gemini_error(exc):
+            await self._announce(
+                f"Gemini server error. Returning to idle. You can say {self.detector.wake_word} to reconnect.",
+                level="error",
+            )
+            self.logger.error("recoverable Gemini error: %s", message)
+            return
+
+        await self._announce(
+            f"Session error. Returning to idle. Details: {message}",
+            level="error",
+        )
+        self.logger.error("non-recoverable session error: %s", message)
+
+    async def stop_session(self, reason):
+        if self.state == "idle":
+            self.logger.info("stop_session ignored in idle: reason=%s", reason)
+            return
+
+        self.logger.info("stop_session requested: reason=%s", reason)
+        if self.state == "connecting" and self.session_task is not None:
+            self.session_task.cancel()
+        elif self.session_stop_event is not None:
+            self.session_stop_event.set()
+
+        if self.session_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.session_task
+
+    async def _cleanup_session(self, session_tasks):
+        for task in session_tasks:
+            task.cancel()
+        for task in session_tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                if self._is_normal_session_close(exc):
+                    self.logger.info("session task closed normally: %s", exc)
+                else:
+                    self.logger.exception("session task cleanup failure: %s", exc)
+
+        self.assistant_speaking = False
+        self.audio_in_queue = None
+        self.out_queue = None
+        self.session = None
+        self.session_stop_event = None
+        self.session_task = None
+        self._set_state("idle")
+
+    async def _run_session(self):
+        self._set_state("connecting")
+        self.session_stop_event = asyncio.Event()
+        session_tasks = []
+        try:
+            async with get_client().aio.live.connect(model=MODEL, config=CONFIG) as session:
+                self.session = session
+                self.audio_in_queue = asyncio.Queue()
+                self.out_queue = asyncio.Queue(maxsize=5)
+                self._set_state("active")
+
+                if self.auto_start:
+                    await self.session.send(input=AUTO_START_PROMPT, end_of_turn=True)
+
+                session_tasks.append(asyncio.create_task(self.send_realtime()))
+                session_tasks.append(asyncio.create_task(self.receive_audio()))
+                session_tasks.append(asyncio.create_task(self.play_audio()))
+
+                if self.video_mode == "camera":
+                    session_tasks.append(asyncio.create_task(self.get_frames()))
+                elif self.video_mode == "screen":
+                    session_tasks.append(asyncio.create_task(self.get_screen()))
+
+                await self.session_stop_event.wait()
+        except asyncio.CancelledError:
+            self.logger.info("session cancelled while state=%s", self.state)
+            raise
+        except Exception as exc:
+            self.logger.exception("session failure")
+            await self._report_session_error(exc)
+        finally:
+            await self._cleanup_session(session_tasks)
+
+    async def start_session(self, reason):
+        if self.state != "idle":
+            self.logger.info("start_session ignored in state=%s reason=%s", self.state, reason)
+            return
+
+        self.logger.info("start_session requested: reason=%s", reason)
+        self.session_task = asyncio.create_task(self._run_session())
+
+    async def run(self):
+        background_tasks = []
+        try:
+            self.logger.info("application start")
+            await self._announce(
+                f"Idle. Say {self.detector.wake_word} to start and {self.detector.exit_word} to return to idle."
+            )
+
+            background_tasks.append(asyncio.create_task(self.listen_microphone()))
+            if self.enable_text_input:
+                background_tasks.append(asyncio.create_task(self.send_text()))
+
+            if not self.wake_word_enabled:
+                await self.control_queue.put(("wake", "startup"))
+
+            while self.running:
+                command, reason = await self.control_queue.get()
+                if command == "wake":
+                    await self.start_session(reason)
+                elif command == "sleep":
+                    await self.stop_session(reason)
+                elif command == "quit":
+                    self.running = False
+                    await self.stop_session(reason)
+                else:
+                    self.logger.warning("unknown command=%s reason=%s", command, reason)
+        except KeyboardInterrupt:
+            self.logger.info("keyboard interrupt")
+        except Exception as exc:
+            self.logger.exception("fatal application error")
+            await self._announce(f"Fatal error: {exc}", level="error")
+            traceback.print_exception(exc)
+        finally:
+            self.running = False
+            await self.stop_session("shutdown")
+            for task in background_tasks:
+                task.cancel()
+            for task in background_tasks:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            if self.audio_stream is not None:
+                with contextlib.suppress(Exception):
+                    self.audio_stream.close()
+            self.logger.info("application stop")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default=DEFAULT_MODE,
+        help="pixels to stream from",
+        choices=["camera", "screen", "none"],
+    )
+    parser.add_argument(
+        "--no-auto-start",
+        action="store_true",
+        help="Disable auto start (model won't speak first).",
+    )
+    parser.add_argument(
+        "--no-text",
+        action="store_true",
+        help="Disable console text input (run hands-free).",
+    )
+    parser.add_argument(
+        "--list-mics",
+        action="store_true",
+        help="List available microphone input devices and exit.",
+    )
+    parser.add_argument(
+        "--mic-index",
+        type=int,
+        default=None,
+        help="PyAudio input device index (use --list-mics to find).",
+    )
+    parser.add_argument(
+        "--strict-turns",
+        action="store_true",
+        help="Disable barge-in by not sending new input while the model is speaking.",
+    )
+    parser.add_argument(
+        "--wake-word",
+        type=str,
+        default=DEFAULT_WAKE_WORD,
+        help="Phrase that starts a Gemini session.",
+    )
+    parser.add_argument(
+        "--exit-word",
+        type=str,
+        default=DEFAULT_EXIT_WORD,
+        help="Phrase that returns the app to idle.",
+    )
+    parser.add_argument(
+        "--no-wake-word",
+        action="store_true",
+        help="Start a session immediately, then fall back to wake-word mode after returning to idle.",
+    )
+    parser.add_argument(
+        "--stt-model-path",
+        type=str,
+        default=os.environ.get("VOSK_MODEL_PATH", DEFAULT_STT_MODEL_PATH),
+        help="Path to the local Vosk speech recognition model directory.",
+    )
+
+    args = parser.parse_args()
+
+    if args.list_mics:
+        list_input_devices()
+        raise SystemExit(0)
+
+    main = AudioLoop(
+        video_mode=args.mode,
+        auto_start=(not args.no_auto_start),
+        enable_text_input=(not args.no_text),
+        mic_index=args.mic_index,
+        strict_turns=args.strict_turns,
+        wake_word=args.wake_word,
+        exit_word=args.exit_word,
+        wake_word_enabled=(not args.no_wake_word),
+        stt_model_path=args.stt_model_path,
+    )
+    asyncio.run(main.run())
