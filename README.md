@@ -1,5 +1,31 @@
 ### install
 
+for raspberry pi users:
+```text
+[Unit]
+Description=My Python Script (uv venv)
+After=network.target
+
+[Service]
+User=t-hara
+WorkingDirectory=/home/t-hara/speak
+ExecStart=/bin/bash -lc '/home/@@@@_user_name_@@@@/.local/bin/uv run python speak.py --wake-word "gemini" --exit-word "see you" --stt-model-path "/home/@@@@_user_name_@@@@/speak/vosk-model-small-en-us-0.15" --mic-index @@@@_yourmic_index_@@@@ --strict-turns --mode none'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+```
+
+```bash
+sudo apt update
+sudo apt install portaudio19-dev
+sudo systemctl daemon-reload
+sudo systemctl enable myscript.service
+sudo systemctl start myscript.service
+```
+
 ```bash
 uv sync
 export $GEMINI_API_KEY="your_gemini_api_key"
