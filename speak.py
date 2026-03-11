@@ -50,6 +50,7 @@ DEFAULT_WAKE_WORD = "gemini"
 DEFAULT_EXIT_WORD = "see you"
 DEFAULT_STT_MODEL_PATH = "./models/vosk-model-small-en-us-0.15"
 LOG_DIR = Path("./logs")
+PROMPTS_DIR = Path("./prompts")
 
 RECOVERABLE_ERROR_PATTERNS = (
     "429",
@@ -69,16 +70,6 @@ RECOVERABLE_ERROR_PATTERNS = (
 )
 
 client = None
-
-# ===== ここを好きに書き換えてOK（あなたのロールプレイ設定）=====
-AUTO_START_PROMPT = (
-    "You are an American exchange student living in Japan. "
-    "You are talking to your roommate in English. "
-    "You are friendly, talkative, and kind. "
-    "You really want to share something surprising that happened yesterday. "
-    "If you hear incorrect English, gently correct it (briefly) and continue naturally. "
-    "Start speaking first now and keep the conversation going."
-)
 
 # LiveConnectConfig（system_instruction は role='system' が安定しやすいです）
 CONFIG = types.LiveConnectConfig(
@@ -150,6 +141,31 @@ def configure_logging():
     return logger
 
 
+def load_prompt_scenarios(prompts_dir=PROMPTS_DIR):
+    scenarios = []
+    for path in sorted(prompts_dir.glob("*.md")):
+        content = path.read_text(encoding="utf-8").strip()
+        if not content:
+            continue
+        title = path.stem.replace("_", " ").replace("-", " ").strip()
+        first_line = content.splitlines()[0].strip()
+        if first_line.startswith("#"):
+            title = first_line.lstrip("#").strip() or title
+        scenarios.append({"path": path, "title": title, "prompt": content})
+
+    if not scenarios:
+        raise RuntimeError(f"No prompt markdown files found in {prompts_dir}.")
+    return scenarios
+
+
+def select_daily_prompt(scenarios, today=None):
+    if not scenarios:
+        raise RuntimeError("No prompt scenarios are available.")
+    current_date = today or dt.date.today()
+    index = current_date.toordinal() % len(scenarios)
+    return scenarios[index]
+
+
 def get_client():
     global client
     if client is None:
@@ -195,7 +211,15 @@ class LocalSpeaker:
 
 
 class LocalCommandDetector:
-    def __init__(self, model_path, wake_word, exit_word, logger, cooldown_seconds=1.5):
+    def __init__(
+        self,
+        model_path,
+        wake_word,
+        exit_word,
+        logger,
+        no_auto_start_wake_word=None,
+        cooldown_seconds=1.5,
+    ):
         if vosk is None:
             raise RuntimeError("vosk is required. Install it with `pip install vosk`.")
 
@@ -208,8 +232,9 @@ class LocalCommandDetector:
         self.logger = logger
         self.wake_word = normalize_phrase(wake_word)
         self.exit_word = normalize_phrase(exit_word)
+        self.no_auto_start_wake_word = normalize_phrase(no_auto_start_wake_word or "")
         self.cooldown_seconds = cooldown_seconds
-        self.last_trigger_at = {"wake": 0.0, "exit": 0.0}
+        self.last_trigger_at = {"wake": 0.0, "exit": 0.0, "no_auto_start_wake": 0.0}
         self.model = vosk.Model(str(resolved))
         self.recognizer = vosk.KaldiRecognizer(self.model, SEND_SAMPLE_RATE)
         self.recognizer.SetWords(False)
@@ -232,6 +257,11 @@ class LocalCommandDetector:
         now = asyncio.get_running_loop().time()
         if phrase_in_text(self.exit_word, text) and self._should_emit("exit", now):
             return "exit"
+        if (
+            phrase_in_text(self.no_auto_start_wake_word, text)
+            and self._should_emit("no_auto_start_wake", now)
+        ):
+            return "no_auto_start_wake"
         if phrase_in_text(self.wake_word, text) and self._should_emit("wake", now):
             return "wake"
         return None
@@ -267,6 +297,7 @@ class AudioLoop:
         strict_turns=False,
         wake_word=DEFAULT_WAKE_WORD,
         exit_word=DEFAULT_EXIT_WORD,
+        no_auto_start_wake_word=None,
         wake_word_enabled=True,
         stt_model_path=DEFAULT_STT_MODEL_PATH,
     ):
@@ -276,6 +307,9 @@ class AudioLoop:
         self.mic_index = mic_index
         self.strict_turns = strict_turns
         self.wake_word_enabled = wake_word_enabled
+        self.no_auto_start_wake_word = normalize_phrase(no_auto_start_wake_word or "")
+        self.prompt_scenarios = load_prompt_scenarios()
+        self.daily_prompt = select_daily_prompt(self.prompt_scenarios)
 
         self.logger = configure_logging()
         self.speaker = LocalSpeaker(self.logger)
@@ -284,6 +318,7 @@ class AudioLoop:
             wake_word=wake_word,
             exit_word=exit_word,
             logger=self.logger,
+            no_auto_start_wake_word=self.no_auto_start_wake_word,
         )
 
         self.audio_stream = None
@@ -309,6 +344,13 @@ class AudioLoop:
         getattr(self.logger, level)("%s", text)
         print(text)
         await self.speaker.speak(text)
+
+    def _show_daily_prompt(self):
+        path = self.daily_prompt["path"]
+        title = self.daily_prompt["title"]
+        message = f"[prompt] {title} ({path.as_posix()})"
+        self.logger.info("daily prompt: %s", message)
+        print(message)
 
     def _get_frame(self, cap):
         ret, frame = cap.read()
@@ -456,9 +498,13 @@ class AudioLoop:
             command = self.detector.feed(data)
             if command == "wake":
                 if self.state == "idle":
-                    await self.control_queue.put(("wake", "voice"))
+                    start_mode = "prompt" if self.no_auto_start_wake_word and not self.auto_start else "default"
+                    await self.control_queue.put(("wake", start_mode, "voice"))
+            elif command == "no_auto_start_wake":
+                if self.state == "idle" and not self.auto_start:
+                    await self.control_queue.put(("wake", "silent", "voice"))
             elif command == "exit":
-                await self.control_queue.put(("sleep", "voice"))
+                await self.control_queue.put(("sleep", None, "voice"))
 
             if self.out_queue is not None and self.state == "active" and not (
                 self.strict_turns and self.assistant_speaking
@@ -470,13 +516,21 @@ class AudioLoop:
             text = await asyncio.to_thread(input, "message > ")
             normalized = normalize_phrase(text)
             if normalized == "q":
-                await self.control_queue.put(("quit", "text"))
+                await self.control_queue.put(("quit", None, "text"))
                 return
             if self.state == "idle" and normalized == self.detector.wake_word:
-                await self.control_queue.put(("wake", "text"))
+                start_mode = "prompt" if self.no_auto_start_wake_word and not self.auto_start else "default"
+                await self.control_queue.put(("wake", start_mode, "text"))
+                continue
+            if (
+                self.state == "idle"
+                and not self.auto_start
+                and normalized == self.detector.no_auto_start_wake_word
+            ):
+                await self.control_queue.put(("wake", "silent", "text"))
                 continue
             if self.state in {"connecting", "active"} and normalized == self.detector.exit_word:
-                await self.control_queue.put(("sleep", "text"))
+                await self.control_queue.put(("sleep", None, "text"))
                 continue
             if self.session is not None and self.state == "active":
                 while self.strict_turns and self.assistant_speaking:
@@ -548,7 +602,7 @@ class AudioLoop:
         self.session_task = None
         self._set_state("idle")
 
-    async def _run_session(self):
+    async def _run_session(self, send_opening_prompt):
         self._set_state("connecting")
         self.session_stop_event = asyncio.Event()
         session_tasks = []
@@ -559,8 +613,8 @@ class AudioLoop:
                 self.out_queue = asyncio.Queue(maxsize=5)
                 self._set_state("active")
 
-                if self.auto_start:
-                    await self.session.send(input=AUTO_START_PROMPT, end_of_turn=True)
+                if send_opening_prompt:
+                    await self.session.send(input=self.daily_prompt["prompt"], end_of_turn=True)
 
                 session_tasks.append(asyncio.create_task(self.send_realtime()))
                 session_tasks.append(asyncio.create_task(self.receive_audio()))
@@ -581,33 +635,48 @@ class AudioLoop:
         finally:
             await self._cleanup_session(session_tasks)
 
-    async def start_session(self, reason):
+    async def start_session(self, reason, send_opening_prompt):
         if self.state != "idle":
             self.logger.info("start_session ignored in state=%s reason=%s", self.state, reason)
             return
 
-        self.logger.info("start_session requested: reason=%s", reason)
-        self.session_task = asyncio.create_task(self._run_session())
+        self.logger.info(
+            "start_session requested: reason=%s send_opening_prompt=%s",
+            reason,
+            send_opening_prompt,
+        )
+        self.session_task = asyncio.create_task(self._run_session(send_opening_prompt))
 
     async def run(self):
         background_tasks = []
         try:
             self.logger.info("application start")
-            await self._announce(
-                f"Idle. Say {self.detector.wake_word} to start and {self.detector.exit_word} to return to idle."
-            )
+            self._show_daily_prompt()
+            if self.no_auto_start_wake_word and not self.auto_start:
+                startup_message = (
+                    f"Idle. Say {self.detector.wake_word} to start with today's prompt,"
+                    f" or say {self.detector.no_auto_start_wake_word} to start without it."
+                    f" Say {self.detector.exit_word} to return to idle."
+                )
+            else:
+                startup_message = (
+                    f"Idle. Say {self.detector.wake_word} to start and {self.detector.exit_word}"
+                    " to return to idle."
+                )
+            await self._announce(startup_message)
 
             background_tasks.append(asyncio.create_task(self.listen_microphone()))
             if self.enable_text_input:
                 background_tasks.append(asyncio.create_task(self.send_text()))
 
             if not self.wake_word_enabled:
-                await self.control_queue.put(("wake", "startup"))
+                await self.control_queue.put(("wake", "default", "startup"))
 
             while self.running:
-                command, reason = await self.control_queue.get()
+                command, start_mode, reason = await self.control_queue.get()
                 if command == "wake":
-                    await self.start_session(reason)
+                    send_opening_prompt = self.auto_start or start_mode == "prompt"
+                    await self.start_session(reason, send_opening_prompt=send_opening_prompt)
                 elif command == "sleep":
                     await self.stop_session(reason)
                 elif command == "quit":
@@ -683,6 +752,12 @@ if __name__ == "__main__":
         help="Phrase that returns the app to idle.",
     )
     parser.add_argument(
+        "--no-auto-start-wake-word",
+        type=str,
+        default=None,
+        help="Alternate phrase that starts a Gemini session from idle when using --no-auto-start.",
+    )
+    parser.add_argument(
         "--no-wake-word",
         action="store_true",
         help="Start a session immediately, then fall back to wake-word mode after returning to idle.",
@@ -708,6 +783,7 @@ if __name__ == "__main__":
         strict_turns=args.strict_turns,
         wake_word=args.wake_word,
         exit_word=args.exit_word,
+        no_auto_start_wake_word=args.no_auto_start_wake_word,
         wake_word_enabled=(not args.no_wake_word),
         stt_model_path=args.stt_model_path,
     )

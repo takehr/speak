@@ -1,0 +1,84 @@
+2026-03-10 23:24:27,148 INFO application start
+2026-03-10 23:24:27,148 INFO Idle. Say hey to start and see you to return to idle.
+2026-03-10 23:25:12,792 INFO stop_session ignored in idle: reason=shutdown
+2026-03-10 23:25:12,958 INFO application stop
+2026-03-10 23:25:31,658 INFO application start
+2026-03-10 23:25:31,658 INFO Idle. Say hey to start and see you to return to idle.
+2026-03-10 23:25:46,974 INFO Detected wake phrase from transcript='hey'
+2026-03-10 23:25:46,976 INFO start_session requested: reason=voice
+2026-03-10 23:25:46,976 INFO state idle -> connecting
+2026-03-10 23:25:47,525 INFO state connecting -> active
+2026-03-10 23:27:38,778 INFO Detected exit phrase from transcript='see you'
+2026-03-10 23:27:38,780 INFO stop_session requested: reason=voice
+2026-03-10 23:27:38,824 INFO receive_audio closed normally: 1000 None. 
+2026-03-10 23:27:38,958 INFO state active -> idle
+2026-03-10 23:27:45,943 INFO Detected wake phrase from transcript='hey'
+2026-03-10 23:27:45,944 INFO start_session requested: reason=voice
+2026-03-10 23:27:45,944 INFO state idle -> connecting
+2026-03-10 23:27:46,129 INFO state connecting -> active
+2026-03-10 23:36:42,074 INFO Detected wake phrase from transcript='hey incredulity'
+2026-03-10 23:39:17,828 INFO Detected wake phrase from transcript='hey'
+2026-03-10 23:39:20,709 INFO Detected wake phrase from transcript='hey'
+2026-03-10 23:40:30,270 INFO Detected wake phrase from transcript='hey'
+2026-03-10 23:40:31,793 INFO Detected wake phrase from transcript='hey hey hey'
+2026-03-10 23:40:33,152 INFO Detected exit phrase from transcript='see you'
+2026-03-10 23:40:33,157 INFO stop_session requested: reason=voice
+2026-03-10 23:40:33,158 ERROR session task cleanup failure: 1011 None. Deadline expired before operation could complete.
+Traceback (most recent call last):
+  File "/Users/haratakehiro/Desktop/speak_dist/.venv/lib/python3.11/site-packages/google/genai/live.py", line 535, in _receive
+    raw_response = await self._ws.recv(decode=False)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/haratakehiro/Desktop/speak_dist/.venv/lib/python3.11/site-packages/websockets/asyncio/connection.py", line 324, in recv
+    raise self.protocol.close_exc from self.recv_exc
+websockets.exceptions.ConnectionClosedError: received 1011 (internal error) Deadline expired before operation could complete.; then sent 1011 (internal error) Deadline expired before operation could complete.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/haratakehiro/Desktop/speak_dist/speak.py", line 534, in _cleanup_session
+    await task
+  File "/Users/haratakehiro/Desktop/speak_dist/speak.py", line 396, in receive_audio
+    async for response in turn:
+  File "/Users/haratakehiro/Desktop/speak_dist/.venv/lib/python3.11/site-packages/google/genai/live.py", line 454, in receive
+    while result := await self._receive():
+                    ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/haratakehiro/Desktop/speak_dist/.venv/lib/python3.11/site-packages/google/genai/live.py", line 545, in _receive
+    errors.APIError.raise_error(code, reason, None)
+  File "/Users/haratakehiro/Desktop/speak_dist/.venv/lib/python3.11/site-packages/google/genai/errors.py", line 163, in raise_error
+    raise cls(status_code, response_json, response)
+google.genai.errors.APIError: 1011 None. Deadline expired before operation could complete.
+2026-03-10 23:40:33,296 INFO state active -> idle
+2026-03-10 23:40:36,995 INFO Detected wake phrase from transcript='hey'
+2026-03-10 23:40:36,995 INFO start_session requested: reason=voice
+2026-03-10 23:40:36,995 INFO state idle -> connecting
+2026-03-10 23:40:37,198 INFO state connecting -> active
+2026-03-10 23:42:48,061 INFO Detected exit phrase from transcript='see you'
+2026-03-10 23:42:48,061 INFO stop_session requested: reason=voice
+2026-03-10 23:42:48,101 INFO receive_audio closed normally: 1000 None. 
+2026-03-10 23:42:48,239 INFO state active -> idle
+2026-03-10 23:43:18,072 INFO Detected wake phrase from transcript='hey'
+2026-03-10 23:43:18,075 INFO start_session requested: reason=voice
+2026-03-10 23:43:18,075 INFO state idle -> connecting
+2026-03-10 23:43:18,272 INFO state connecting -> active
+2026-03-10 23:43:28,828 INFO Detected exit phrase from transcript='see you'
+2026-03-10 23:43:28,828 INFO stop_session requested: reason=voice
+2026-03-10 23:43:28,870 INFO receive_audio closed normally: 1000 None. 
+2026-03-10 23:43:29,006 INFO state active -> idle
+2026-03-10 23:43:51,421 INFO Detected wake phrase from transcript='hey'
+2026-03-10 23:43:51,423 INFO start_session requested: reason=voice
+2026-03-10 23:43:51,423 INFO state idle -> connecting
+2026-03-10 23:43:51,617 INFO state connecting -> active
+2026-03-10 23:48:57,081 INFO Detected exit phrase from transcript='he see you'
+2026-03-10 23:48:57,082 INFO stop_session requested: reason=voice
+2026-03-10 23:48:57,125 INFO receive_audio closed normally: 1000 None. 
+2026-03-10 23:48:57,264 INFO state active -> idle
+2026-03-10 23:49:49,171 INFO Detected wake phrase from transcript='hey'
+2026-03-10 23:49:49,172 INFO start_session requested: reason=voice
+2026-03-10 23:49:49,172 INFO state idle -> connecting
+2026-03-10 23:49:49,390 INFO state connecting -> active
+2026-03-10 23:52:05,048 INFO Detected exit phrase from transcript='see you'
+2026-03-10 23:52:05,050 INFO stop_session requested: reason=voice
+2026-03-10 23:52:05,090 INFO receive_audio closed normally: 1000 None. 
+2026-03-10 23:52:05,230 INFO state active -> idle
+2026-03-10 23:52:09,547 INFO stop_session ignored in idle: reason=shutdown
+2026-03-10 23:52:09,662 INFO application stop

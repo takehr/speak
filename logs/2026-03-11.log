@@ -1,0 +1,99 @@
+2026-03-11 18:03:34,445 INFO application start
+2026-03-11 18:03:34,446 INFO Idle. Say gemini to start and bye to return to idle. While connected with --no-auto-start, say hey to have Gemini speak first.
+2026-03-11 18:03:55,995 INFO Detected no_auto_start_wake phrase from transcript='hey'
+2026-03-11 18:03:59,110 INFO Detected no_auto_start_wake phrase from transcript='hey'
+2026-03-11 18:04:03,669 INFO Detected wake phrase from transcript='gemini'
+2026-03-11 18:04:03,669 INFO start_session requested: reason=voice
+2026-03-11 18:04:03,669 INFO state idle -> connecting
+2026-03-11 18:04:03,669 ERROR session failure
+Traceback (most recent call last):
+  File "/Users/haratakehiro/Desktop/speak_dist/speak.py", line 583, in _run_session
+    async with get_client().aio.live.connect(model=MODEL, config=CONFIG) as session:
+               ^^^^^^^^^^^^
+  File "/Users/haratakehiro/Desktop/speak_dist/speak.py", line 158, in get_client
+    raise RuntimeError("GEMINI_API_KEY is not set.")
+RuntimeError: GEMINI_API_KEY is not set.
+2026-03-11 18:04:03,671 ERROR Session error. Returning to idle. Details: GEMINI_API_KEY is not set.
+2026-03-11 18:04:03,674 ERROR non-recoverable session error: GEMINI_API_KEY is not set.
+2026-03-11 18:04:03,674 INFO state connecting -> idle
+2026-03-11 18:04:08,205 INFO stop_session ignored in idle: reason=shutdown
+2026-03-11 18:04:08,321 INFO application stop
+2026-03-11 18:05:14,088 INFO application start
+2026-03-11 18:05:14,089 INFO Idle. Say gemini to start and bye to return to idle. While connected with --no-auto-start, say hey to have Gemini speak first.
+2026-03-11 18:05:30,397 INFO Detected no_auto_start_wake phrase from transcript='hey'
+2026-03-11 18:05:34,201 INFO Detected no_auto_start_wake phrase from transcript='hey'
+2026-03-11 18:05:36,630 INFO Detected no_auto_start_wake phrase from transcript='hey'
+2026-03-11 18:05:40,478 INFO Detected no_auto_start_wake phrase from transcript='hey'
+2026-03-11 18:06:06,135 INFO Detected no_auto_start_wake phrase from transcript='hey'
+2026-03-11 18:07:23,817 INFO stop_session ignored in idle: reason=shutdown
+2026-03-11 18:07:23,935 INFO application stop
+2026-03-11 18:14:36,940 INFO application start
+2026-03-11 18:14:36,940 INFO Idle. Say gemini to start and bye to return to idle. With --no-auto-start, you can also say hey while idle to start a session.
+2026-03-11 18:14:46,069 INFO Detected no_auto_start_wake phrase from transcript='hey'
+2026-03-11 18:14:46,069 INFO start_session requested: reason=voice
+2026-03-11 18:14:46,069 INFO state idle -> connecting
+2026-03-11 18:14:47,572 INFO state connecting -> active
+2026-03-11 18:17:26,393 INFO Detected exit phrase from transcript='bye bye'
+2026-03-11 18:17:26,395 INFO stop_session requested: reason=voice
+2026-03-11 18:17:26,439 INFO receive_audio closed normally: 1000 None. 
+2026-03-11 18:17:26,578 INFO state active -> idle
+2026-03-11 18:17:28,762 INFO Detected exit phrase from transcript='bye bye'
+2026-03-11 18:17:28,765 INFO stop_session ignored in idle: reason=voice
+2026-03-11 18:17:35,021 INFO Detected no_auto_start_wake phrase from transcript='hey'
+2026-03-11 18:17:35,021 INFO start_session requested: reason=voice
+2026-03-11 18:17:35,021 INFO state idle -> connecting
+2026-03-11 18:17:35,241 INFO state connecting -> active
+2026-03-11 18:18:00,438 INFO Detected exit phrase from transcript='bye bye'
+2026-03-11 18:18:00,440 INFO stop_session requested: reason=voice
+2026-03-11 18:18:00,485 INFO receive_audio closed normally: 1000 None. 
+2026-03-11 18:18:00,621 INFO state active -> idle
+2026-03-11 18:18:03,136 INFO Detected exit phrase from transcript='bye bye'
+2026-03-11 18:18:03,137 INFO stop_session ignored in idle: reason=voice
+2026-03-11 18:18:04,648 INFO Detected exit phrase from transcript='bye bye bye bye'
+2026-03-11 18:18:04,658 INFO stop_session ignored in idle: reason=voice
+2026-03-11 18:18:06,201 INFO Detected exit phrase from transcript='provide provide bye bye bye'
+2026-03-11 18:18:06,202 INFO stop_session ignored in idle: reason=voice
+2026-03-11 18:18:08,067 INFO stop_session ignored in idle: reason=shutdown
+2026-03-11 18:18:08,182 INFO application stop
+2026-03-11 19:42:41,023 INFO application start
+2026-03-11 19:42:41,023 INFO Idle. Say gemini to start and bye to return to idle. With --no-auto-start, you can also say hey while idle to start a session.
+2026-03-11 19:42:50,666 INFO Detected wake phrase from transcript='hi gemini'
+2026-03-11 19:42:50,667 INFO start_session requested: reason=voice
+2026-03-11 19:42:50,667 INFO state idle -> connecting
+2026-03-11 19:42:51,086 INFO state connecting -> active
+2026-03-11 19:42:57,899 INFO Detected wake phrase from transcript='gemini'
+2026-03-11 19:47:53,541 INFO Detected exit phrase from transcript='bye bye'
+2026-03-11 19:47:53,541 INFO stop_session requested: reason=voice
+2026-03-11 19:47:53,585 INFO receive_audio closed normally: 1000 None. 
+2026-03-11 19:47:53,722 INFO state active -> idle
+2026-03-11 19:47:57,133 INFO Detected wake phrase from transcript='gemini'
+2026-03-11 19:47:57,136 INFO start_session requested: reason=voice
+2026-03-11 19:47:57,136 INFO state idle -> connecting
+2026-03-11 19:47:57,645 INFO state connecting -> active
+2026-03-11 19:48:13,723 INFO Detected exit phrase from transcript='bye bye'
+2026-03-11 19:48:13,724 INFO stop_session requested: reason=voice
+2026-03-11 19:48:13,767 INFO receive_audio closed normally: 1000 None. 
+2026-03-11 19:48:13,905 INFO state active -> idle
+2026-03-11 20:08:28,013 INFO Detected no_auto_start_wake phrase from transcript='hey'
+2026-03-11 20:08:28,016 INFO start_session requested: reason=voice
+2026-03-11 20:08:28,016 INFO state idle -> connecting
+2026-03-11 20:08:28,367 INFO state connecting -> active
+2026-03-11 20:09:20,528 INFO Detected exit phrase from transcript='bye bye'
+2026-03-11 20:09:20,530 INFO stop_session requested: reason=voice
+2026-03-11 20:09:20,573 INFO receive_audio closed normally: 1000 None. 
+2026-03-11 20:09:20,705 INFO state active -> idle
+2026-03-11 20:09:33,681 INFO stop_session ignored in idle: reason=shutdown
+2026-03-11 20:09:33,792 INFO application stop
+2026-03-11 20:12:22,994 INFO application start
+2026-03-11 20:12:22,994 INFO daily prompt: [prompt] Admin Task: Schedule Change (prompts/admin_schedule_change.md)
+2026-03-11 20:12:22,995 INFO Idle. Say gemini to start and bye to return to idle. With --no-auto-start, you can also say hey while idle to start a session.
+2026-03-11 20:12:31,626 INFO Detected wake phrase from transcript='huh gemini'
+2026-03-11 20:12:31,628 INFO start_session requested: reason=voice
+2026-03-11 20:12:31,628 INFO state idle -> connecting
+2026-03-11 20:12:31,903 INFO state connecting -> active
+2026-03-11 20:12:43,413 INFO Detected exit phrase from transcript='bye bye'
+2026-03-11 20:12:43,414 INFO stop_session requested: reason=voice
+2026-03-11 20:12:43,459 INFO receive_audio closed normally: 1000 None. 
+2026-03-11 20:12:43,596 INFO state active -> idle
+2026-03-11 20:12:45,111 INFO stop_session ignored in idle: reason=shutdown
+2026-03-11 20:12:45,223 INFO application stop
