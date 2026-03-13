@@ -20,6 +20,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import traceback
 from pathlib import Path
 
@@ -60,6 +61,7 @@ DEFAULT_STT_MODEL_PATH = "./models/vosk-model-small-en-us-0.15"
 LOG_DIR = Path("./logs")
 PROMPTS_DIR = Path("./prompts")
 IDLE_SOUND_PATH = Path("./VSQSE_0522_pirorin_01.mp3")
+IDLE_SOUND_HELPER_PATH = Path("./play_idle_sound.py")
 
 RECOVERABLE_ERROR_PATTERNS = (
     "429",
@@ -432,21 +434,9 @@ class AudioLoop:
             return None
 
         if system_name == "Windows":
-            powershell = shutil.which("powershell") or shutil.which("powershell.exe") or shutil.which("pwsh")
-            if powershell is None:
+            if not IDLE_SOUND_HELPER_PATH.exists():
                 return None
-            script = (
-                "Add-Type -AssemblyName PresentationCore;"
-                "$player = New-Object System.Windows.Media.MediaPlayer;"
-                f"$player.Open([Uri]'{sound_path}');"
-                "$player.Volume = 1.0;"
-                "$player.Play();"
-                "while (-not $player.NaturalDuration.HasTimeSpan) { Start-Sleep -Milliseconds 50 };"
-                "Start-Sleep -Milliseconds ([int]$player.NaturalDuration.TimeSpan.TotalMilliseconds + 200);"
-                "$player.Stop();"
-                "$player.Close();"
-            )
-            return [powershell, "-NoProfile", "-Command", script]
+            return [sys.executable, str(IDLE_SOUND_HELPER_PATH.resolve()), sound_path]
 
         linux_candidates = (
             ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", sound_path],
