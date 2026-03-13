@@ -11,7 +11,6 @@ import argparse
 import asyncio
 import base64
 import contextlib
-import ctypes
 import datetime as dt
 import io
 import json
@@ -20,6 +19,7 @@ import os
 import platform
 import re
 import shutil
+import subprocess
 import traceback
 from pathlib import Path
 
@@ -225,28 +225,6 @@ class LocalSoundPlayer:
         self.available = pygame is not None
         self._mixer_ready = False
 
-    def _play_windows_blocking(self, path):
-        alias = "idle_sound"
-        command_buffer_length = 1024
-        quoted_path = str(path).replace('"', '""')
-
-        def send(command):
-            buffer = ctypes.create_unicode_buffer(command_buffer_length)
-            error_code = ctypes.windll.winmm.mciSendStringW(command, buffer, command_buffer_length, 0)
-            if error_code != 0:
-                error_buffer = ctypes.create_unicode_buffer(command_buffer_length)
-                ctypes.windll.winmm.mciGetErrorStringW(error_code, error_buffer, command_buffer_length)
-                raise RuntimeError(error_buffer.value or f"MCI error {error_code}")
-            return buffer.value
-
-        try:
-            send(f'open "{quoted_path}" type mpegvideo alias {alias}')
-            send(f"play {alias} wait")
-            return True
-        finally:
-            with contextlib.suppress(Exception):
-                send(f"close {alias}")
-
     def _ensure_mixer(self):
         if not self.available:
             return False
@@ -281,11 +259,7 @@ class LocalSoundPlayer:
 
     async def play(self, path):
         if platform.system() == "Windows":
-            try:
-                return await asyncio.to_thread(self._play_windows_blocking, path)
-            except Exception as exc:  # pragma: no cover - environment dependent
-                self.logger.warning("windows sound playback failed: %s", exc)
-                return False
+            return False
         if not self.available:
             return False
         try:
@@ -462,11 +436,15 @@ class AudioLoop:
             if powershell is None:
                 return None
             script = (
-                "$player = New-Object -ComObject WMPlayer.OCX;"
-                f"$media = $player.newMedia('{sound_path}');"
-                "$player.currentPlaylist.appendItem($media);"
-                "$player.controls.play();"
-                "while ($player.playState -ne 1) { Start-Sleep -Milliseconds 100 }"
+                "Add-Type -AssemblyName PresentationCore;"
+                "$player = New-Object System.Windows.Media.MediaPlayer;"
+                f"$player.Open([Uri]'{sound_path}');"
+                "$player.Volume = 1.0;"
+                "$player.Play();"
+                "while (-not $player.NaturalDuration.HasTimeSpan) { Start-Sleep -Milliseconds 50 };"
+                "Start-Sleep -Milliseconds ([int]$player.NaturalDuration.TimeSpan.TotalMilliseconds + 200);"
+                "$player.Stop();"
+                "$player.Close();"
             )
             return [powershell, "-NoProfile", "-Command", script]
 
@@ -496,6 +474,18 @@ class AudioLoop:
             return
 
         try:
+            if platform.system() == "Windows":
+                creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+                    subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+                )
+                subprocess.Popen(
+                    command,
+                    creationflags=creationflags,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self._status("idle sound playback started in detached helper")
+                return
             process = await asyncio.create_subprocess_exec(*command)
             await process.wait()
             self._status(f"idle sound playback finished with code {process.returncode}")
