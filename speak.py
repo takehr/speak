@@ -240,12 +240,21 @@ class LocalSoundPlayer:
     def _play_blocking(self, path):
         if not self._ensure_mixer():
             return False
-        pygame.mixer.music.load(str(path))
-        pygame.mixer.music.play()
-        clock = pygame.time.Clock()
-        while pygame.mixer.music.get_busy():
-            clock.tick(20)
-        return True
+        try:
+            pygame.mixer.music.load(str(path))
+            pygame.mixer.music.play()
+            clock = pygame.time.Clock()
+            while pygame.mixer.music.get_busy():
+                clock.tick(20)
+            return True
+        finally:
+            with contextlib.suppress(Exception):
+                pygame.mixer.music.stop()
+            with contextlib.suppress(Exception):
+                pygame.mixer.music.unload()
+            with contextlib.suppress(Exception):
+                pygame.mixer.quit()
+            self._mixer_ready = False
 
     async def play(self, path):
         if not self.available:
