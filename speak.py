@@ -36,6 +36,11 @@ except ImportError:
     pyttsx3 = None
 
 try:
+    import pygame
+except ImportError:
+    pygame = None
+
+try:
     import vosk
 except ImportError:
     vosk = None
@@ -213,6 +218,45 @@ class LocalSpeaker:
             self.logger.warning("TTS failed: %s", exc)
 
 
+class LocalSoundPlayer:
+    def __init__(self, logger):
+        self.logger = logger
+        self.available = pygame is not None
+        self._mixer_ready = False
+
+    def _ensure_mixer(self):
+        if not self.available:
+            return False
+        if self._mixer_ready:
+            return True
+        try:
+            pygame.mixer.init()
+            self._mixer_ready = True
+            return True
+        except Exception as exc:  # pragma: no cover - environment dependent
+            self.logger.warning("pygame mixer init failed: %s", exc)
+            return False
+
+    def _play_blocking(self, path):
+        if not self._ensure_mixer():
+            return False
+        pygame.mixer.music.load(str(path))
+        pygame.mixer.music.play()
+        clock = pygame.time.Clock()
+        while pygame.mixer.music.get_busy():
+            clock.tick(20)
+        return True
+
+    async def play(self, path):
+        if not self.available:
+            return False
+        try:
+            return await asyncio.to_thread(self._play_blocking, path)
+        except Exception as exc:  # pragma: no cover - environment dependent
+            self.logger.warning("pygame sound playback failed: %s", exc)
+            return False
+
+
 class LocalCommandDetector:
     def __init__(
         self,
@@ -316,6 +360,7 @@ class AudioLoop:
 
         self.logger = configure_logging()
         self.speaker = LocalSpeaker(self.logger)
+        self.sound_player = LocalSoundPlayer(self.logger)
         self.detector = LocalCommandDetector(
             model_path=stt_model_path,
             wake_word=wake_word,
@@ -398,6 +443,8 @@ class AudioLoop:
     async def _play_idle_sound(self):
         if not IDLE_SOUND_PATH.exists():
             self.logger.warning("idle sound not found: %s", IDLE_SOUND_PATH)
+            return
+        if await self.sound_player.play(IDLE_SOUND_PATH):
             return
         command = self._get_idle_sound_command()
         if command is None:
