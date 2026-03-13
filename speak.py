@@ -16,6 +16,7 @@ import io
 import json
 import logging
 import os
+import platform
 import re
 import shutil
 import traceback
@@ -360,16 +361,51 @@ class AudioLoop:
         self.logger.info("daily prompt: %s", message)
         print(message)
 
+    def _get_idle_sound_command(self):
+        sound_path = str(IDLE_SOUND_PATH.resolve())
+        system_name = platform.system()
+
+        if system_name == "Darwin":
+            if shutil.which("afplay") is not None:
+                return ["afplay", sound_path]
+            return None
+
+        if system_name == "Windows":
+            powershell = shutil.which("powershell") or shutil.which("powershell.exe") or shutil.which("pwsh")
+            if powershell is None:
+                return None
+            script = (
+                "$player = New-Object -ComObject WMPlayer.OCX;"
+                f"$media = $player.newMedia('{sound_path}');"
+                "$player.currentPlaylist.appendItem($media);"
+                "$player.controls.play();"
+                "while ($player.playState -ne 1) { Start-Sleep -Milliseconds 100 }"
+            )
+            return [powershell, "-NoProfile", "-Command", script]
+
+        linux_candidates = (
+            ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", sound_path],
+            ["mpg123", "-q", sound_path],
+            ["mpg321", "-q", sound_path],
+            ["mpv", "--no-video", "--really-quiet", sound_path],
+            ["cvlc", "--play-and-exit", "--quiet", sound_path],
+        )
+        for command in linux_candidates:
+            if shutil.which(command[0]) is not None:
+                return command
+        return None
+
     async def _play_idle_sound(self):
         if not IDLE_SOUND_PATH.exists():
             self.logger.warning("idle sound not found: %s", IDLE_SOUND_PATH)
             return
-        if shutil.which("afplay") is None:
-            self.logger.warning("idle sound skipped: afplay is not available")
+        command = self._get_idle_sound_command()
+        if command is None:
+            self.logger.warning("idle sound skipped: no supported audio player is available")
             return
 
         try:
-            process = await asyncio.create_subprocess_exec("afplay", str(IDLE_SOUND_PATH))
+            process = await asyncio.create_subprocess_exec(*command)
             await process.wait()
         except Exception as exc:  # pragma: no cover - environment dependent
             self.logger.warning("idle sound playback failed: %s", exc)
