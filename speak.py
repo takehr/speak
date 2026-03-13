@@ -381,6 +381,10 @@ class AudioLoop:
         self.state = "idle"
         self.control_queue = asyncio.Queue()
 
+    def _status(self, text, level="info"):
+        getattr(self.logger, level)("%s", text)
+        print(f"[status] {text}")
+
     def _set_state(self, new_state):
         previous_state = self.state
         if previous_state == new_state:
@@ -442,20 +446,23 @@ class AudioLoop:
 
     async def _play_idle_sound(self):
         if not IDLE_SOUND_PATH.exists():
-            self.logger.warning("idle sound not found: %s", IDLE_SOUND_PATH)
+            self._status(f"idle sound not found: {IDLE_SOUND_PATH}", level="warning")
             return
+        self._status(f"playing idle sound: {IDLE_SOUND_PATH.name}")
         if await self.sound_player.play(IDLE_SOUND_PATH):
+            self._status("idle sound playback finished")
             return
         command = self._get_idle_sound_command()
         if command is None:
-            self.logger.warning("idle sound skipped: no supported audio player is available")
+            self._status("idle sound skipped: no supported audio player is available", level="warning")
             return
 
         try:
             process = await asyncio.create_subprocess_exec(*command)
             await process.wait()
+            self._status(f"idle sound playback finished with code {process.returncode}")
         except Exception as exc:  # pragma: no cover - environment dependent
-            self.logger.warning("idle sound playback failed: %s", exc)
+            self._status(f"idle sound playback failed: {exc}", level="warning")
 
     def _get_frame(self, cap):
         ret, frame = cap.read()
@@ -604,11 +611,16 @@ class AudioLoop:
             if command == "wake":
                 if self.state == "idle":
                     start_mode = "prompt" if self.no_auto_start_wake_word and not self.auto_start else "default"
+                    self._status(
+                        f"wake word detected from voice; startup mode={start_mode}"
+                    )
                     await self.control_queue.put(("wake", start_mode, "voice"))
             elif command == "no_auto_start_wake":
                 if self.state == "idle" and not self.auto_start:
+                    self._status("no-auto-start wake word detected from voice; startup mode=silent")
                     await self.control_queue.put(("wake", "silent", "voice"))
             elif command == "exit":
+                self._status("exit word detected from voice")
                 await self.control_queue.put(("sleep", None, "voice"))
 
             if self.out_queue is not None and self.state == "active" and not (
@@ -621,10 +633,14 @@ class AudioLoop:
             text = await asyncio.to_thread(input, "message > ")
             normalized = normalize_phrase(text)
             if normalized == "q":
+                self._status("quit requested from text input")
                 await self.control_queue.put(("quit", None, "text"))
                 return
             if self.state == "idle" and normalized == self.detector.wake_word:
                 start_mode = "prompt" if self.no_auto_start_wake_word and not self.auto_start else "default"
+                self._status(
+                    f"wake word detected from text; startup mode={start_mode}"
+                )
                 await self.control_queue.put(("wake", start_mode, "text"))
                 continue
             if (
@@ -632,9 +648,11 @@ class AudioLoop:
                 and not self.auto_start
                 and normalized == self.detector.no_auto_start_wake_word
             ):
+                self._status("no-auto-start wake word detected from text; startup mode=silent")
                 await self.control_queue.put(("wake", "silent", "text"))
                 continue
             if self.state in {"connecting", "active"} and normalized == self.detector.exit_word:
+                self._status("exit word detected from text")
                 await self.control_queue.put(("sleep", None, "text"))
                 continue
             if self.session is not None and self.state == "active":
@@ -675,6 +693,7 @@ class AudioLoop:
             self.logger.info("stop_session ignored in idle: reason=%s", reason)
             return
 
+        self._status(f"stopping session; reason={reason}")
         self.logger.info("stop_session requested: reason=%s", reason)
         if self.state == "connecting" and self.session_task is not None:
             self.session_task.cancel()
@@ -686,6 +705,7 @@ class AudioLoop:
                 await self.session_task
 
     async def _cleanup_session(self, session_tasks):
+        self._status("cleaning up session tasks")
         for task in session_tasks:
             task.cancel()
         for task in session_tasks:
@@ -709,6 +729,7 @@ class AudioLoop:
 
     async def _run_session(self, send_opening_prompt):
         self._set_state("connecting")
+        self._status(f"opening Gemini live session; send_opening_prompt={send_opening_prompt}")
         self.session_stop_event = asyncio.Event()
         session_tasks = []
         try:
@@ -719,7 +740,10 @@ class AudioLoop:
                 self._set_state("active")
 
                 if send_opening_prompt:
+                    self._status(f"sending opening prompt: {self.daily_prompt['title']}")
                     await self.session.send(input=self.daily_prompt["prompt"], end_of_turn=True)
+                else:
+                    self._status("session started without opening prompt")
 
                 session_tasks.append(asyncio.create_task(self.send_realtime()))
                 session_tasks.append(asyncio.create_task(self.receive_audio()))
@@ -733,9 +757,11 @@ class AudioLoop:
                 await self.session_stop_event.wait()
         except asyncio.CancelledError:
             self.logger.info("session cancelled while state=%s", self.state)
+            self._status("session cancelled")
             raise
         except Exception as exc:
             self.logger.exception("session failure")
+            self._status(f"session failure: {exc}", level="error")
             await self._report_session_error(exc)
         finally:
             await self._cleanup_session(session_tasks)
@@ -750,12 +776,16 @@ class AudioLoop:
             reason,
             send_opening_prompt,
         )
+        self._status(
+            f"starting session; reason={reason}; send_opening_prompt={send_opening_prompt}"
+        )
         self.session_task = asyncio.create_task(self._run_session(send_opening_prompt))
 
     async def run(self):
         background_tasks = []
         try:
             self.logger.info("application start")
+            self._status("application start")
             self._show_daily_prompt()
             if self.no_auto_start_wake_word and not self.auto_start:
                 startup_message = (
@@ -775,10 +805,14 @@ class AudioLoop:
                 background_tasks.append(asyncio.create_task(self.send_text()))
 
             if not self.wake_word_enabled:
+                self._status("wake word disabled at startup; starting session immediately")
                 await self.control_queue.put(("wake", "default", "startup"))
 
             while self.running:
                 command, start_mode, reason = await self.control_queue.get()
+                self._status(
+                    f"received control command={command} start_mode={start_mode} reason={reason}"
+                )
                 if command == "wake":
                     send_opening_prompt = self.auto_start or start_mode == "prompt"
                     await self.start_session(reason, send_opening_prompt=send_opening_prompt)
@@ -791,12 +825,15 @@ class AudioLoop:
                     self.logger.warning("unknown command=%s reason=%s", command, reason)
         except KeyboardInterrupt:
             self.logger.info("keyboard interrupt")
+            self._status("keyboard interrupt received")
         except Exception as exc:
             self.logger.exception("fatal application error")
+            self._status(f"fatal application error: {exc}", level="error")
             await self._announce(f"Fatal error: {exc}", level="error")
             traceback.print_exception(exc)
         finally:
             self.running = False
+            self._status("application shutdown start")
             await self.stop_session("shutdown")
             for task in background_tasks:
                 task.cancel()
@@ -807,6 +844,7 @@ class AudioLoop:
                 with contextlib.suppress(Exception):
                     self.audio_stream.close()
             self.logger.info("application stop")
+            self._status("application stop")
 
 
 if __name__ == "__main__":
