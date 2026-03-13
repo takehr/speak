@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import ctypes
 import datetime as dt
 import io
 import json
@@ -224,6 +225,28 @@ class LocalSoundPlayer:
         self.available = pygame is not None
         self._mixer_ready = False
 
+    def _play_windows_blocking(self, path):
+        alias = "idle_sound"
+        command_buffer_length = 1024
+        quoted_path = str(path).replace('"', '""')
+
+        def send(command):
+            buffer = ctypes.create_unicode_buffer(command_buffer_length)
+            error_code = ctypes.windll.winmm.mciSendStringW(command, buffer, command_buffer_length, 0)
+            if error_code != 0:
+                error_buffer = ctypes.create_unicode_buffer(command_buffer_length)
+                ctypes.windll.winmm.mciGetErrorStringW(error_code, error_buffer, command_buffer_length)
+                raise RuntimeError(error_buffer.value or f"MCI error {error_code}")
+            return buffer.value
+
+        try:
+            send(f'open "{quoted_path}" type mpegvideo alias {alias}')
+            send(f"play {alias} wait")
+            return True
+        finally:
+            with contextlib.suppress(Exception):
+                send(f"close {alias}")
+
     def _ensure_mixer(self):
         if not self.available:
             return False
@@ -257,6 +280,12 @@ class LocalSoundPlayer:
             self._mixer_ready = False
 
     async def play(self, path):
+        if platform.system() == "Windows":
+            try:
+                return await asyncio.to_thread(self._play_windows_blocking, path)
+            except Exception as exc:  # pragma: no cover - environment dependent
+                self.logger.warning("windows sound playback failed: %s", exc)
+                return False
         if not self.available:
             return False
         try:
