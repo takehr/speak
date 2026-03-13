@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import traceback
 from pathlib import Path
 
@@ -51,6 +52,7 @@ DEFAULT_EXIT_WORD = "see you"
 DEFAULT_STT_MODEL_PATH = "./models/vosk-model-small-en-us-0.15"
 LOG_DIR = Path("./logs")
 PROMPTS_DIR = Path("./prompts")
+IDLE_SOUND_PATH = Path("./VSQSE_0522_pirorin_01.mp3")
 
 RECOVERABLE_ERROR_PATTERNS = (
     "429",
@@ -334,11 +336,17 @@ class AudioLoop:
         self.control_queue = asyncio.Queue()
 
     def _set_state(self, new_state):
-        if self.state == new_state:
+        previous_state = self.state
+        if previous_state == new_state:
             return
-        self.logger.info("state %s -> %s", self.state, new_state)
-        print(f"[state] {self.state} -> {new_state}")
+        self.logger.info("state %s -> %s", previous_state, new_state)
+        print(f"[state] {previous_state} -> {new_state}")
         self.state = new_state
+        if previous_state == "active" and new_state == "idle":
+            try:
+                asyncio.get_running_loop().create_task(self._play_idle_sound())
+            except RuntimeError:
+                self.logger.warning("idle sound skipped: no running event loop")
 
     async def _announce(self, text, level="info"):
         getattr(self.logger, level)("%s", text)
@@ -351,6 +359,20 @@ class AudioLoop:
         message = f"[prompt] {title} ({path.as_posix()})"
         self.logger.info("daily prompt: %s", message)
         print(message)
+
+    async def _play_idle_sound(self):
+        if not IDLE_SOUND_PATH.exists():
+            self.logger.warning("idle sound not found: %s", IDLE_SOUND_PATH)
+            return
+        if shutil.which("afplay") is None:
+            self.logger.warning("idle sound skipped: afplay is not available")
+            return
+
+        try:
+            process = await asyncio.create_subprocess_exec("afplay", str(IDLE_SOUND_PATH))
+            await process.wait()
+        except Exception as exc:  # pragma: no cover - environment dependent
+            self.logger.warning("idle sound playback failed: %s", exc)
 
     def _get_frame(self, cap):
         ret, frame = cap.read()
