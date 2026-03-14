@@ -53,6 +53,7 @@ Current starter set:
 - conference discussion / Q&A
 - conference small talk
 - administrative tasks
+- daily life / settling in
 
 To add a new scenario, drop another markdown file into `./prompts`.
 The full markdown content is sent as the opening prompt when auto-start is enabled.
