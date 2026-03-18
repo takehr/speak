@@ -82,31 +82,38 @@ RECOVERABLE_ERROR_PATTERNS = (
 
 client = None
 
-# LiveConnectConfig（system_instruction は role='system' が安定しやすいです）
-CONFIG = types.LiveConnectConfig(
-    response_modalities=["AUDIO"],
-    media_resolution="MEDIA_RESOLUTION_MEDIUM",
-    speech_config=types.SpeechConfig(
-        voice_config=types.VoiceConfig(
-            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
-        )
-    ),
-    realtime_input_config=types.RealtimeInputConfig(
-        turn_coverage="TURN_INCLUDES_ALL_INPUT"
-    ),
-    context_window_compression=types.ContextWindowCompressionConfig(
-        trigger_tokens=25600,
-        sliding_window=types.SlidingWindow(target_tokens=12800),
-    ),
-    system_instruction=types.Content(
-        parts=[
-            types.Part.from_text(
-                text="Follow the user's roleplay setup. Keep responses natural and conversational."
+
+def build_live_config(enable_search=False):
+    tools = None
+    if enable_search:
+        tools = [types.Tool(google_search=types.GoogleSearch())]
+
+    # LiveConnectConfig（system_instruction は role='system' が安定しやすいです）
+    return types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        media_resolution="MEDIA_RESOLUTION_MEDIUM",
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
             )
-        ],
-        role="system",
-    ),
-)
+        ),
+        realtime_input_config=types.RealtimeInputConfig(
+            turn_coverage="TURN_INCLUDES_ALL_INPUT"
+        ),
+        context_window_compression=types.ContextWindowCompressionConfig(
+            trigger_tokens=25600,
+            sliding_window=types.SlidingWindow(target_tokens=12800),
+        ),
+        system_instruction=types.Content(
+            parts=[
+                types.Part.from_text(
+                    text="Follow the user's roleplay setup. Keep responses natural and conversational."
+                )
+            ],
+            role="system",
+        ),
+        tools=tools,
+    )
 
 pya = pyaudio.PyAudio()
 
@@ -371,6 +378,7 @@ class AudioLoop:
         self.no_auto_start_wake_word = normalize_phrase(no_auto_start_wake_word or "")
         self.prompt_scenarios = load_prompt_scenarios()
         self.daily_prompt = select_daily_prompt(self.prompt_scenarios)
+        self.live_config = build_live_config(enable_search=(not self.auto_start))
 
         self.logger = configure_logging()
         self.speaker = LocalSpeaker(self.logger)
@@ -747,11 +755,15 @@ class AudioLoop:
 
     async def _run_session(self, send_opening_prompt):
         self._set_state("connecting")
-        self._status(f"opening Gemini live session; send_opening_prompt={send_opening_prompt}")
+        self._status(
+            "opening Gemini live session; "
+            f"send_opening_prompt={send_opening_prompt}; "
+            f"search_enabled={not self.auto_start}"
+        )
         self.session_stop_event = asyncio.Event()
         session_tasks = []
         try:
-            async with get_client().aio.live.connect(model=MODEL, config=CONFIG) as session:
+            async with get_client().aio.live.connect(model=MODEL, config=self.live_config) as session:
                 self.session = session
                 self.audio_in_queue = asyncio.Queue()
                 self.out_queue = asyncio.Queue(maxsize=5)

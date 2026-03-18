@@ -60,6 +60,7 @@ The full markdown content is sent as the opening prompt when auto-start is enabl
 
 ### sample for `--no-auto-start`
 When you start with `--no-auto-start`, Gemini connects without sending the first turn.
+In this mode, the Live session also enables the Google Search tool.
 If you also set `--no-auto-start-wake-word`, you get two idle startup paths:
 - `--wake-word`: start with today's prompt
 - `--no-auto-start-wake-word`: start without today's prompt
