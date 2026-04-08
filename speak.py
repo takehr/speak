@@ -9,12 +9,12 @@ pip install google-genai opencv-python pyaudio pillow mss vosk pyttsx3
 
 import argparse
 import asyncio
-import base64
 import contextlib
 import datetime as dt
 import io
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -36,11 +36,6 @@ try:
     import pyttsx3
 except ImportError:
     pyttsx3 = None
-
-try:
-    import pygame
-except ImportError:
-    pygame = None
 
 try:
     import vosk
@@ -207,6 +202,10 @@ def iter_response_parts(response):
     return response.server_content.model_turn.parts
 
 
+def make_user_text_turn(text):
+    return types.Content(role="user", parts=[types.Part.from_text(text=text)])
+
+
 class LocalSpeaker:
     def __init__(self, logger):
         self.logger = logger
@@ -231,11 +230,26 @@ class LocalSpeaker:
 class LocalSoundPlayer:
     def __init__(self, logger):
         self.logger = logger
-        self.available = pygame is not None
+        self.available = platform.system() not in {"Darwin", "Windows"}
         self._mixer_ready = False
+        self._pygame = None
+
+    def _load_pygame(self):
+        if not self.available:
+            return None
+        if self._pygame is not None:
+            return self._pygame
+        try:
+            import pygame  # pylint: disable=import-outside-toplevel
+        except ImportError:
+            self.available = False
+            return None
+        self._pygame = pygame
+        return pygame
 
     def _ensure_mixer(self):
-        if not self.available:
+        pygame = self._load_pygame()
+        if pygame is None:
             return False
         if self._mixer_ready:
             return True
@@ -248,6 +262,9 @@ class LocalSoundPlayer:
             return False
 
     def _play_blocking(self, path):
+        pygame = self._load_pygame()
+        if pygame is None:
+            return False
         if not self._ensure_mixer():
             return False
         try:
@@ -267,8 +284,6 @@ class LocalSoundPlayer:
             self._mixer_ready = False
 
     async def play(self, path):
-        if platform.system() == "Windows":
-            return False
         if not self.available:
             return False
         try:
@@ -402,10 +417,58 @@ class AudioLoop:
         self.running = True
         self.state = "idle"
         self.control_queue = asyncio.Queue()
+        self._last_realtime_send_log = 0.0
+        self._last_receive_wait_log = 0.0
+        self._last_receive_chunk_log = 0.0
+        self._last_audio_play_log = 0.0
+        self._last_mic_health_log = 0.0
+        self._stdin_reader = None
+        self._stdin_read_transport = None
+
+    def _loop_time(self):
+        return asyncio.get_running_loop().time()
+
+    def _debug_every(self, attr_name, interval_seconds):
+        now = self._loop_time()
+        previous = getattr(self, attr_name, 0.0)
+        if now - previous < interval_seconds:
+            return False
+        setattr(self, attr_name, now)
+        return True
 
     def _status(self, text, level="info"):
         getattr(self.logger, level)("%s", text)
         print(f"[status] {text}")
+
+    async def _ensure_stdin_reader(self):
+        if self._stdin_reader is not None:
+            return self._stdin_reader
+        loop = asyncio.get_running_loop()
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader)
+        transport, _ = await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+        self._stdin_reader = reader
+        self._stdin_read_transport = transport
+        return reader
+
+    def _close_stdin_reader(self):
+        if self._stdin_read_transport is not None:
+            with contextlib.suppress(Exception):
+                self._stdin_read_transport.close()
+        self._stdin_reader = None
+        self._stdin_read_transport = None
+
+    def _pcm16_rms(self, data):
+        if not data:
+            return 0.0
+        sample_count = len(data) // 2
+        if sample_count == 0:
+            return 0.0
+        total = 0.0
+        for i in range(0, sample_count * 2, 2):
+            sample = int.from_bytes(data[i : i + 2], byteorder="little", signed=True)
+            total += sample * sample
+        return math.sqrt(total / sample_count)
 
     def _set_state(self, new_state):
         previous_state = self.state
@@ -504,7 +567,11 @@ class AudioLoop:
         image_io.seek(0)
 
         image_bytes = image_io.read()
-        return {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode()}
+        return {
+            "kind": "media",
+            "data": image_bytes,
+            "mime_type": "image/jpeg",
+        }
 
     async def get_frames(self):
         cap = await asyncio.to_thread(cv2.VideoCapture, 0)
@@ -541,7 +608,11 @@ class AudioLoop:
         image_io.seek(0)
 
         image_bytes = image_io.read()
-        return {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode()}
+        return {
+            "kind": "media",
+            "data": image_bytes,
+            "mime_type": "image/jpeg",
+        }
 
     async def get_screen(self):
         while self.running and self.state == "active":
@@ -563,7 +634,25 @@ class AudioLoop:
                 continue
             msg = await self.out_queue.get()
             if self.session is not None:
-                await self.session.send(input=msg)
+                if self._debug_every("_last_realtime_send_log", 5.0):
+                    queue_size = self.out_queue.qsize() if self.out_queue is not None else 0
+                    self._status(
+                        f"realtime send loop alive; kind={msg.get('kind')} out_queue={queue_size}"
+                    )
+                if msg.get("kind") == "audio":
+                    await self.session.send_realtime_input(
+                        audio=types.Blob(
+                            data=msg["data"],
+                            mime_type=msg["mime_type"],
+                        )
+                    )
+                else:
+                    await self.session.send_realtime_input(
+                        media=types.Blob(
+                            data=msg["data"],
+                            mime_type=msg["mime_type"],
+                        )
+                    )
 
     async def receive_audio(self):
         try:
@@ -572,8 +661,13 @@ class AudioLoop:
                     await asyncio.sleep(0.01)
                     continue
 
+                if self._debug_every("_last_receive_wait_log", 5.0):
+                    self._status("waiting for Gemini response")
+
                 turn = self.session.receive()
                 async for response in turn:
+                    if self._debug_every("_last_receive_chunk_log", 2.0):
+                        self._status("received Gemini response chunk")
                     for part in iter_response_parts(response):
                         if part.inline_data and isinstance(part.inline_data.data, bytes):
                             self.assistant_speaking = True
@@ -582,6 +676,8 @@ class AudioLoop:
                             continue
                         if isinstance(part.text, str) and not getattr(part, "thought", False):
                             print(part.text, end="")
+
+                self._status("Gemini turn complete")
 
                 self.assistant_speaking = False
                 if not self.strict_turns and self.audio_in_queue is not None:
@@ -594,6 +690,7 @@ class AudioLoop:
             raise
 
     async def play_audio(self):
+        self._status("opening local speaker stream")
         stream = await asyncio.to_thread(
             pya.open,
             format=FORMAT,
@@ -607,8 +704,12 @@ class AudioLoop:
                     await asyncio.sleep(0.01)
                     continue
                 bytestream = await self.audio_in_queue.get()
+                if self._debug_every("_last_audio_play_log", 2.0):
+                    pending = self.audio_in_queue.qsize() if self.audio_in_queue is not None else 0
+                    self._status(f"playing model audio locally; pending_audio_chunks={pending}")
                 await asyncio.to_thread(stream.write, bytestream)
         finally:
+            self._status("closing local speaker stream")
             await asyncio.to_thread(stream.close)
 
     async def listen_microphone(self):
@@ -617,6 +718,8 @@ class AudioLoop:
             mic_index = mic_info["index"]
         else:
             mic_index = self.mic_index
+
+        self._status(f"opening microphone stream; mic_index={mic_index}")
 
         self.audio_stream = await asyncio.to_thread(
             pya.open,
@@ -627,11 +730,18 @@ class AudioLoop:
             input_device_index=mic_index,
             frames_per_buffer=CHUNK_SIZE,
         )
+        self._status("microphone stream opened")
 
         kwargs = {"exception_on_overflow": False} if __debug__ else {}
 
         while self.running:
             data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
+            if self._debug_every("_last_mic_health_log", 5.0):
+                rms = self._pcm16_rms(data)
+                detector_state = "speaking" if self.assistant_speaking else "listening"
+                self._status(
+                    f"microphone loop alive; state={self.state}; detector={detector_state}; rms={rms:.0f}"
+                )
 
             command = self.detector.feed(data)
             if command == "wake":
@@ -652,11 +762,23 @@ class AudioLoop:
             if self.out_queue is not None and self.state == "active" and not (
                 self.strict_turns and self.assistant_speaking
             ):
-                await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
+                await self.out_queue.put(
+                    {
+                        "kind": "audio",
+                        "data": data,
+                        "mime_type": f"audio/pcm;rate={SEND_SAMPLE_RATE}",
+                    }
+                )
 
     async def send_text(self):
+        reader = await self._ensure_stdin_reader()
         while self.running:
-            text = await asyncio.to_thread(input, "message > ")
+            print("message > ", end="", flush=True)
+            line = await reader.readline()
+            if not line:
+                self._status("stdin closed; stopping text input")
+                return
+            text = line.decode(errors="replace").rstrip("\r\n")
             normalized = normalize_phrase(text)
             if normalized == "q":
                 self._status("quit requested from text input")
@@ -684,7 +806,12 @@ class AudioLoop:
             if self.session is not None and self.state == "active":
                 while self.strict_turns and self.assistant_speaking:
                     await asyncio.sleep(0.05)
-                await self.session.send(input=text or ".", end_of_turn=True)
+                self._status("sending text turn to Gemini")
+                await self.session.send_client_content(
+                    turns=make_user_text_turn(text or "."),
+                    turn_complete=True,
+                )
+                self._status("text turn sent")
 
     def _is_recoverable_gemini_error(self, exc):
         message = normalize_phrase(str(exc))
@@ -769,12 +896,6 @@ class AudioLoop:
                 self.out_queue = asyncio.Queue(maxsize=5)
                 self._set_state("active")
 
-                if send_opening_prompt:
-                    self._status(f"sending opening prompt: {self.daily_prompt['title']}")
-                    await self.session.send(input=self.daily_prompt["prompt"], end_of_turn=True)
-                else:
-                    self._status("session started without opening prompt")
-
                 session_tasks.append(asyncio.create_task(self.send_realtime()))
                 session_tasks.append(asyncio.create_task(self.receive_audio()))
                 session_tasks.append(asyncio.create_task(self.play_audio()))
@@ -783,6 +904,16 @@ class AudioLoop:
                     session_tasks.append(asyncio.create_task(self.get_frames()))
                 elif self.video_mode == "screen":
                     session_tasks.append(asyncio.create_task(self.get_screen()))
+
+                if send_opening_prompt:
+                    self._status(f"sending opening prompt: {self.daily_prompt['title']}")
+                    await self.session.send_client_content(
+                        turns=make_user_text_turn(self.daily_prompt["prompt"]),
+                        turn_complete=True,
+                    )
+                    self._status("opening prompt sent")
+                else:
+                    self._status("session started without opening prompt")
 
                 await self.session_stop_event.wait()
         except asyncio.CancelledError:
@@ -870,6 +1001,7 @@ class AudioLoop:
             for task in background_tasks:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+            self._close_stdin_reader()
             if self.audio_stream is not None:
                 with contextlib.suppress(Exception):
                     self.audio_stream.close()
