@@ -41,6 +41,7 @@ uv pip install vosk
 uv run python speak.py
 uv run python speak.py --list-mics
 uv run python speak.py --wake-word "gemini" --exit-word "see you" --stt-model-path "./vosk-model-small-en-us-0.15" --mic-index 4 --strict-turns --mode none
+uv run python speak.py --wake-word "gemini" --mimic-wake-word "copy mode" --exit-word "see you" --stt-model-path "./vosk-model-small-en-us-0.15" --mic-index 4 --strict-turns --mode none
 uv run python speak.py --no-auto-start --no-auto-start-wake-word "start talking" --wake-word "gemini" --exit-word "see you" --stt-model-path "./vosk-model-small-en-us-0.15" --mic-index 4 --strict-turns --mode none
 ```
 
@@ -63,12 +64,25 @@ When you start with `--no-auto-start`, Gemini connects without sending the first
 In this mode, the Live session also enables the Google Search tool.
 If you also set `--no-auto-start-wake-word`, you get two idle startup paths:
 - `--wake-word`: start with today's prompt
+- `--mimic-wake-word`: start mimic mode with a model answer first
 - `--no-auto-start-wake-word`: start without today's prompt
+
+### mimic mode
+`--mimic-wake-word` starts a shadowing-style session based on today's daily prompt.
+In this mode, Gemini should:
+- give a polished model answer first
+- wait for the user to imitate it
+- check how closely the user copied the wording and meaning
+- give feedback on pronunciation, rhythm, stress, and missing or changed words
+- ask for a retry
+
+Default mimic wake word: `copy mode`
 
 ````md
 # hands-free no-auto-start sample
 
 - idle wake word: `gemini`
+- mimic wake word: `copy mode`
 - no-auto-start idle wake word: `start talking`
 - exit word: `see you`
 
@@ -78,6 +92,7 @@ example:
 uv run python speak.py \
   --no-auto-start \
   --wake-word "gemini" \
+  --mimic-wake-word "copy mode" \
   --no-auto-start-wake-word "start talking" \
   --exit-word "see you" \
   --stt-model-path "./vosk-model-small-en-us-0.15" \

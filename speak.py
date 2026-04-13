@@ -51,6 +51,7 @@ CHUNK_SIZE = 1024
 MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 DEFAULT_MODE = "camera"
 DEFAULT_WAKE_WORD = "gemini"
+DEFAULT_MIMIC_WAKE_WORD = "copy mode"
 DEFAULT_EXIT_WORD = "see you"
 DEFAULT_STT_MODEL_PATH = "./models/vosk-model-small-en-us-0.15"
 LOG_DIR = Path("./logs")
@@ -206,6 +207,39 @@ def make_user_text_turn(text):
     return types.Content(role="user", parts=[types.Part.from_text(text=text)])
 
 
+def build_mimic_mode_prompt(daily_prompt):
+    title = daily_prompt["title"]
+    scenario = daily_prompt["prompt"].strip()
+    return f"""You are an English shadowing coach for a Japanese learner.
+
+Use today's scenario below as the source situation.
+
+Scenario title: {title}
+
+Scenario instructions:
+{scenario}
+
+Run the conversation in this order:
+1. First, give one short model answer in natural spoken English that fits the scenario well. Make it sound polished, not textbook-like.
+2. Tell the user to repeat your answer as closely as possible.
+3. After the user speaks, compare their response with your model answer and give concise feedback in Japanese.
+4. In the feedback, explicitly check:
+   - whether the meaning and wording stayed close to the model answer
+   - whether any words were dropped, changed, or added
+   - whether pronunciation, stress, rhythm, or linking sounded unnatural
+   - whether the user fully copied the answer or still sounded different from the model
+5. Then give one short retry suggestion and ask the user to repeat again.
+
+Important behavior rules:
+- Keep each model answer short: about 1 to 3 sentences.
+- Prioritize imitation quality over free conversation.
+- If the user's answer is far from the model answer, point that out clearly but kindly.
+- When judging pronunciation, use the user's audio and wording together.
+- Keep feedback practical and specific, with a coach-like tone.
+- Stay in this shadowing loop unless the user clearly wants to stop or change topics.
+"""
+
+
 class LocalSpeaker:
     def __init__(self, logger):
         self.logger = logger
@@ -298,6 +332,7 @@ class LocalCommandDetector:
         self,
         model_path,
         wake_word,
+        mimic_wake_word,
         exit_word,
         logger,
         no_auto_start_wake_word=None,
@@ -314,10 +349,16 @@ class LocalCommandDetector:
 
         self.logger = logger
         self.wake_word = normalize_phrase(wake_word)
+        self.mimic_wake_word = normalize_phrase(mimic_wake_word)
         self.exit_word = normalize_phrase(exit_word)
         self.no_auto_start_wake_word = normalize_phrase(no_auto_start_wake_word or "")
         self.cooldown_seconds = cooldown_seconds
-        self.last_trigger_at = {"wake": 0.0, "exit": 0.0, "no_auto_start_wake": 0.0}
+        self.last_trigger_at = {
+            "wake": 0.0,
+            "mimic_wake": 0.0,
+            "exit": 0.0,
+            "no_auto_start_wake": 0.0,
+        }
         self.model = vosk.Model(str(resolved))
         self.recognizer = vosk.KaldiRecognizer(self.model, SEND_SAMPLE_RATE)
         self.recognizer.SetWords(False)
@@ -340,6 +381,8 @@ class LocalCommandDetector:
         now = asyncio.get_running_loop().time()
         if phrase_in_text(self.exit_word, text) and self._should_emit("exit", now):
             return "exit"
+        if phrase_in_text(self.mimic_wake_word, text) and self._should_emit("mimic_wake", now):
+            return "mimic_wake"
         if (
             phrase_in_text(self.no_auto_start_wake_word, text)
             and self._should_emit("no_auto_start_wake", now)
@@ -379,6 +422,7 @@ class AudioLoop:
         mic_index=None,
         strict_turns=False,
         wake_word=DEFAULT_WAKE_WORD,
+        mimic_wake_word=DEFAULT_MIMIC_WAKE_WORD,
         exit_word=DEFAULT_EXIT_WORD,
         no_auto_start_wake_word=None,
         wake_word_enabled=True,
@@ -401,6 +445,7 @@ class AudioLoop:
         self.detector = LocalCommandDetector(
             model_path=stt_model_path,
             wake_word=wake_word,
+            mimic_wake_word=mimic_wake_word,
             exit_word=exit_word,
             logger=self.logger,
             no_auto_start_wake_word=self.no_auto_start_wake_word,
@@ -487,6 +532,13 @@ class AudioLoop:
         message = f"[prompt] {title} ({path.as_posix()})"
         self.logger.info("daily prompt: %s", message)
         print(message)
+
+    def _build_opening_prompt(self, session_mode):
+        if session_mode == "silent":
+            return None
+        if session_mode == "mimic":
+            return build_mimic_mode_prompt(self.daily_prompt)
+        return self.daily_prompt["prompt"]
 
     def _get_idle_sound_command(self):
         sound_path = str(IDLE_SOUND_PATH.resolve())
@@ -739,14 +791,18 @@ class AudioLoop:
             command = self.detector.feed(data)
             if command == "wake":
                 if self.state == "idle":
-                    start_mode = "prompt" if self.no_auto_start_wake_word and not self.auto_start else "default"
+                    session_mode = "prompt" if self.no_auto_start_wake_word and not self.auto_start else "default"
                     self._status(
-                        f"wake word detected from voice; startup mode={start_mode}"
+                        f"wake word detected from voice; session_mode={session_mode}"
                     )
-                    await self.control_queue.put(("wake", start_mode, "voice"))
+                    await self.control_queue.put(("wake", session_mode, "voice"))
+            elif command == "mimic_wake":
+                if self.state == "idle":
+                    self._status("mimic wake word detected from voice; session_mode=mimic")
+                    await self.control_queue.put(("wake", "mimic", "voice"))
             elif command == "no_auto_start_wake":
                 if self.state == "idle" and not self.auto_start:
-                    self._status("no-auto-start wake word detected from voice; startup mode=silent")
+                    self._status("no-auto-start wake word detected from voice; session_mode=silent")
                     await self.control_queue.put(("wake", "silent", "voice"))
             elif command == "exit":
                 self._status("exit word detected from voice")
@@ -780,18 +836,22 @@ class AudioLoop:
                 await self.control_queue.put(("quit", None, "text"))
                 return
             if self.state == "idle" and normalized == self.detector.wake_word:
-                start_mode = "prompt" if self.no_auto_start_wake_word and not self.auto_start else "default"
+                session_mode = "prompt" if self.no_auto_start_wake_word and not self.auto_start else "default"
                 self._status(
-                    f"wake word detected from text; startup mode={start_mode}"
+                    f"wake word detected from text; session_mode={session_mode}"
                 )
-                await self.control_queue.put(("wake", start_mode, "text"))
+                await self.control_queue.put(("wake", session_mode, "text"))
+                continue
+            if self.state == "idle" and normalized == self.detector.mimic_wake_word:
+                self._status("mimic wake word detected from text; session_mode=mimic")
+                await self.control_queue.put(("wake", "mimic", "text"))
                 continue
             if (
                 self.state == "idle"
                 and not self.auto_start
                 and normalized == self.detector.no_auto_start_wake_word
             ):
-                self._status("no-auto-start wake word detected from text; startup mode=silent")
+                self._status("no-auto-start wake word detected from text; session_mode=silent")
                 await self.control_queue.put(("wake", "silent", "text"))
                 continue
             if self.state in {"connecting", "active"} and normalized == self.detector.exit_word:
@@ -875,11 +935,13 @@ class AudioLoop:
         self.session_task = None
         self._set_state("idle")
 
-    async def _run_session(self, send_opening_prompt):
+    async def _run_session(self, session_mode):
         self._set_state("connecting")
+        opening_prompt = self._build_opening_prompt(session_mode)
         self._status(
             "opening Gemini live session; "
-            f"send_opening_prompt={send_opening_prompt}; "
+            f"session_mode={session_mode}; "
+            f"send_opening_prompt={opening_prompt is not None}; "
             f"search_enabled={not self.auto_start}"
         )
         self.session_stop_event = asyncio.Event()
@@ -900,10 +962,12 @@ class AudioLoop:
                 elif self.video_mode == "screen":
                     session_tasks.append(asyncio.create_task(self.get_screen()))
 
-                if send_opening_prompt:
-                    self._status(f"sending opening prompt: {self.daily_prompt['title']}")
+                if opening_prompt is not None:
+                    self._status(
+                        f"sending opening prompt: {self.daily_prompt['title']} ({session_mode})"
+                    )
                     await self.session.send_client_content(
-                        turns=make_user_text_turn(self.daily_prompt["prompt"]),
+                        turns=make_user_text_turn(opening_prompt),
                         turn_complete=True,
                     )
                     self._status("opening prompt sent")
@@ -922,20 +986,20 @@ class AudioLoop:
         finally:
             await self._cleanup_session(session_tasks)
 
-    async def start_session(self, reason, send_opening_prompt):
+    async def start_session(self, reason, session_mode):
         if self.state != "idle":
             self.logger.info("start_session ignored in state=%s reason=%s", self.state, reason)
             return
 
         self.logger.info(
-            "start_session requested: reason=%s send_opening_prompt=%s",
+            "start_session requested: reason=%s session_mode=%s",
             reason,
-            send_opening_prompt,
+            session_mode,
         )
         self._status(
-            f"starting session; reason={reason}; send_opening_prompt={send_opening_prompt}"
+            f"starting session; reason={reason}; session_mode={session_mode}"
         )
-        self.session_task = asyncio.create_task(self._run_session(send_opening_prompt))
+        self.session_task = asyncio.create_task(self._run_session(session_mode))
 
     async def run(self):
         background_tasks = []
@@ -946,13 +1010,15 @@ class AudioLoop:
             if self.no_auto_start_wake_word and not self.auto_start:
                 startup_message = (
                     f"Idle. Say {self.detector.wake_word} to start with today's prompt,"
+                    f" say {self.detector.mimic_wake_word} for mimic mode,"
                     f" or say {self.detector.no_auto_start_wake_word} to start without it."
                     f" Say {self.detector.exit_word} to return to idle."
                 )
             else:
                 startup_message = (
-                    f"Idle. Say {self.detector.wake_word} to start and {self.detector.exit_word}"
-                    " to return to idle."
+                    f"Idle. Say {self.detector.wake_word} to start,"
+                    f" say {self.detector.mimic_wake_word} for mimic mode,"
+                    f" and say {self.detector.exit_word} to return to idle."
                 )
             await self._announce(startup_message)
 
@@ -967,11 +1033,14 @@ class AudioLoop:
             while self.running:
                 command, start_mode, reason = await self.control_queue.get()
                 self._status(
-                    f"received control command={command} start_mode={start_mode} reason={reason}"
+                    f"received control command={command} session_mode={start_mode} reason={reason}"
                 )
                 if command == "wake":
-                    send_opening_prompt = self.auto_start or start_mode == "prompt"
-                    await self.start_session(reason, send_opening_prompt=send_opening_prompt)
+                    if start_mode == "default":
+                        session_mode = "prompt" if self.auto_start else "silent"
+                    else:
+                        session_mode = start_mode
+                    await self.start_session(reason, session_mode=session_mode)
                 elif command == "sleep":
                     await self.stop_session(reason)
                 elif command == "quit":
@@ -1046,6 +1115,12 @@ if __name__ == "__main__":
         help="Phrase that starts a Gemini session.",
     )
     parser.add_argument(
+        "--mimic-wake-word",
+        type=str,
+        default=DEFAULT_MIMIC_WAKE_WORD,
+        help="Phrase that starts mimic mode with a model answer and imitation feedback.",
+    )
+    parser.add_argument(
         "--exit-word",
         type=str,
         default=DEFAULT_EXIT_WORD,
@@ -1082,6 +1157,7 @@ if __name__ == "__main__":
         mic_index=args.mic_index,
         strict_turns=args.strict_turns,
         wake_word=args.wake_word,
+        mimic_wake_word=args.mimic_wake_word,
         exit_word=args.exit_word,
         no_auto_start_wake_word=args.no_auto_start_wake_word,
         wake_word_enabled=(not args.no_wake_word),
