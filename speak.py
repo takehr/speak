@@ -440,16 +440,9 @@ class AudioLoop:
         getattr(self.logger, level)("%s", text)
         print(f"[status] {text}")
 
-    async def _ensure_stdin_reader(self):
-        if self._stdin_reader is not None:
-            return self._stdin_reader
-        loop = asyncio.get_running_loop()
-        reader = asyncio.StreamReader()
-        protocol = asyncio.StreamReaderProtocol(reader)
-        transport, _ = await loop.connect_read_pipe(lambda: protocol, sys.stdin)
-        self._stdin_reader = reader
-        self._stdin_read_transport = transport
-        return reader
+    def _read_stdin_line_blocking(self):
+        stream = getattr(sys.stdin, "buffer", sys.stdin)
+        return stream.readline()
 
     def _close_stdin_reader(self):
         if self._stdin_read_transport is not None:
@@ -771,14 +764,16 @@ class AudioLoop:
                 )
 
     async def send_text(self):
-        reader = await self._ensure_stdin_reader()
         while self.running:
             print("message > ", end="", flush=True)
-            line = await reader.readline()
+            line = await asyncio.to_thread(self._read_stdin_line_blocking)
             if not line:
                 self._status("stdin closed; stopping text input")
                 return
-            text = line.decode(errors="replace").rstrip("\r\n")
+            if isinstance(line, bytes):
+                text = line.decode(errors="replace").rstrip("\r\n")
+            else:
+                text = str(line).rstrip("\r\n")
             normalized = normalize_phrase(text)
             if normalized == "q":
                 self._status("quit requested from text input")
@@ -1092,4 +1087,7 @@ if __name__ == "__main__":
         wake_word_enabled=(not args.no_wake_word),
         stt_model_path=args.stt_model_path,
     )
-    asyncio.run(main.run())
+    try:
+        asyncio.run(main.run())
+    except KeyboardInterrupt:
+        pass
