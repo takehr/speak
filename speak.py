@@ -47,6 +47,9 @@ CHANNELS = 1
 SEND_SAMPLE_RATE = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE = 1024
+REALTIME_SEND_TIMEOUT_SECONDS = 10.0
+OUT_QUEUE_STALL_TIMEOUT_SECONDS = 10.0
+HEALTH_CHECK_INTERVAL_SECONDS = 1.0
 
 MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 DEFAULT_MODE = "camera"
@@ -467,6 +470,8 @@ class AudioLoop:
         self._last_receive_chunk_log = 0.0
         self._last_audio_play_log = 0.0
         self._last_mic_health_log = 0.0
+        self._last_out_queue_full_log = 0.0
+        self._out_queue_full_since = None
         self._stdin_reader = None
         self._stdin_read_transport = None
 
@@ -484,6 +489,32 @@ class AudioLoop:
     def _status(self, text, level="info"):
         getattr(self.logger, level)("%s", text)
         print(f"[status] {text}")
+
+    async def _enqueue_realtime_message(self, message):
+        if self.out_queue is None or self.state != "active":
+            return False
+
+        while self.out_queue.full():
+            if self._out_queue_full_since is None:
+                self._out_queue_full_since = self._loop_time()
+
+            try:
+                dropped = self.out_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            if self._debug_every("_last_out_queue_full_log", 2.0):
+                self._status(
+                    "realtime input queue full; dropping oldest "
+                    f"{dropped.get('kind', 'unknown')} frame to stay responsive",
+                    level="warning",
+                )
+
+        if not self.out_queue.full():
+            self._out_queue_full_since = None
+
+        self.out_queue.put_nowait(message)
+        return True
 
     def _read_stdin_line_blocking(self):
         stream = getattr(sys.stdin, "buffer", sys.stdin)
@@ -631,7 +662,7 @@ class AudioLoop:
                 if self.out_queue is not None and not (
                     self.strict_turns and self.assistant_speaking
                 ):
-                    await self.out_queue.put(frame)
+                    await self._enqueue_realtime_message(frame)
         finally:
             cap.release()
 
@@ -670,34 +701,46 @@ class AudioLoop:
             if self.out_queue is not None and not (
                 self.strict_turns and self.assistant_speaking
             ):
-                await self.out_queue.put(frame)
+                await self._enqueue_realtime_message(frame)
 
     async def send_realtime(self):
-        while self.running and self.state == "active":
-            if self.out_queue is None:
-                await asyncio.sleep(0.01)
-                continue
-            msg = await self.out_queue.get()
-            if self.session is not None:
-                if self._debug_every("_last_realtime_send_log", 5.0):
-                    queue_size = self.out_queue.qsize() if self.out_queue is not None else 0
-                    self._status(
-                        f"realtime send loop alive; kind={msg.get('kind')} out_queue={queue_size}"
-                    )
-                if msg.get("kind") == "audio":
-                    await self.session.send_realtime_input(
-                        audio=types.Blob(
-                            data=msg["data"],
-                            mime_type=msg["mime_type"],
+        try:
+            while self.running and self.state == "active":
+                if self.out_queue is None:
+                    await asyncio.sleep(0.01)
+                    continue
+                msg = await self.out_queue.get()
+                if self.session is not None:
+                    if self._debug_every("_last_realtime_send_log", 5.0):
+                        queue_size = self.out_queue.qsize() if self.out_queue is not None else 0
+                        self._status(
+                            f"realtime send loop alive; kind={msg.get('kind')} out_queue={queue_size}"
                         )
-                    )
-                else:
-                    await self.session.send_realtime_input(
-                        media=types.Blob(
-                            data=msg["data"],
-                            mime_type=msg["mime_type"],
+                    if msg.get("kind") == "audio":
+                        await asyncio.wait_for(
+                            self.session.send_realtime_input(
+                                audio=types.Blob(
+                                    data=msg["data"],
+                                    mime_type=msg["mime_type"],
+                                )
+                            ),
+                            timeout=REALTIME_SEND_TIMEOUT_SECONDS,
                         )
-                    )
+                    else:
+                        await asyncio.wait_for(
+                            self.session.send_realtime_input(
+                                media=types.Blob(
+                                    data=msg["data"],
+                                    mime_type=msg["mime_type"],
+                                )
+                            ),
+                            timeout=REALTIME_SEND_TIMEOUT_SECONDS,
+                        )
+                    self._out_queue_full_since = None
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"realtime audio send stalled for more than {REALTIME_SEND_TIMEOUT_SECONDS:.0f}s"
+            ) from exc
 
     async def receive_audio(self):
         try:
@@ -811,13 +854,32 @@ class AudioLoop:
             if self.out_queue is not None and self.state == "active" and not (
                 self.strict_turns and self.assistant_speaking
             ):
-                await self.out_queue.put(
+                await self._enqueue_realtime_message(
                     {
                         "kind": "audio",
                         "data": data,
                         "mime_type": f"audio/pcm;rate={SEND_SAMPLE_RATE}",
                     }
                 )
+
+    async def monitor_session_health(self):
+        while self.running and self.state == "active":
+            await asyncio.sleep(HEALTH_CHECK_INTERVAL_SECONDS)
+            if self.session_stop_event is None or self.out_queue is None:
+                continue
+            if self._out_queue_full_since is None:
+                continue
+
+            stall_for = self._loop_time() - self._out_queue_full_since
+            if stall_for < OUT_QUEUE_STALL_TIMEOUT_SECONDS:
+                continue
+
+            self._status(
+                "realtime send queue stalled; returning to idle to recover",
+                level="warning",
+            )
+            self.session_stop_event.set()
+            return
 
     async def send_text(self):
         while self.running:
@@ -930,6 +992,7 @@ class AudioLoop:
         self.assistant_speaking = False
         self.audio_in_queue = None
         self.out_queue = None
+        self._out_queue_full_since = None
         self.session = None
         self.session_stop_event = None
         self.session_task = None
@@ -951,11 +1014,13 @@ class AudioLoop:
                 self.session = session
                 self.audio_in_queue = asyncio.Queue()
                 self.out_queue = asyncio.Queue(maxsize=5)
+                self._out_queue_full_since = None
                 self._set_state("active")
 
                 session_tasks.append(asyncio.create_task(self.send_realtime()))
                 session_tasks.append(asyncio.create_task(self.receive_audio()))
                 session_tasks.append(asyncio.create_task(self.play_audio()))
+                session_tasks.append(asyncio.create_task(self.monitor_session_health()))
 
                 if self.video_mode == "camera":
                     session_tasks.append(asyncio.create_task(self.get_frames()))
