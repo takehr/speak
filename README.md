@@ -86,7 +86,7 @@ In this mode, Gemini should:
 - say the Japanese translation of that answer first
 - ask the user to express it in English
 - give feedback in Japanese about meaning and naturalness
-- then reveal or refine the English answer and continue the loop
+- keep the user on the same sentence until it becomes natural enough, then move on
 
 Default translate wake word: `translate`
 
