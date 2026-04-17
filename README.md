@@ -65,6 +65,7 @@ In this mode, the Live session also enables the Google Search tool.
 If you also set `--no-auto-start-wake-word`, you get two idle startup paths:
 - `--wake-word`: start with today's prompt
 - `--mimic-wake-word`: start mimic mode with a model answer first
+- `--translate-wake-word`: start Japanese-to-English translation practice
 - `--no-auto-start-wake-word`: start without today's prompt
 
 ### mimic mode
@@ -78,11 +79,23 @@ In this mode, Gemini should:
 
 Default mimic wake word: `copy mode`
 
+### translate mode
+`--translate-wake-word` starts an instant sentence translation session based on today's daily prompt.
+In this mode, Gemini should:
+- prepare a polished model answer internally
+- say the Japanese translation of that answer first
+- ask the user to express it in English
+- give feedback in Japanese about meaning and naturalness
+- then reveal or refine the English answer and continue the loop
+
+Default translate wake word: `translate`
+
 ````md
 # hands-free no-auto-start sample
 
 - idle wake word: `gemini`
 - mimic wake word: `copy mode`
+- translate wake word: `translate`
 - no-auto-start idle wake word: `start talking`
 - exit word: `see you`
 
@@ -93,6 +106,7 @@ uv run python speak.py \
   --no-auto-start \
   --wake-word "gemini" \
   --mimic-wake-word "copy mode" \
+  --translate-wake-word "translate" \
   --no-auto-start-wake-word "start talking" \
   --exit-word "see you" \
   --stt-model-path "./vosk-model-small-en-us-0.15" \

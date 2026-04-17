@@ -55,6 +55,7 @@ MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 DEFAULT_MODE = "camera"
 DEFAULT_WAKE_WORD = "gemini"
 DEFAULT_MIMIC_WAKE_WORD = "copy mode"
+DEFAULT_TRANSLATE_WAKE_WORD = "translate"
 DEFAULT_EXIT_WORD = "see you"
 DEFAULT_STT_MODEL_PATH = "./models/vosk-model-small-en-us-0.15"
 LOG_DIR = Path("./logs")
@@ -243,6 +244,35 @@ Important behavior rules:
 """
 
 
+def build_translate_mode_prompt(daily_prompt):
+    title = daily_prompt["title"]
+    scenario = daily_prompt["prompt"].strip()
+    return f"""You are an English speaking coach for a Japanese learner doing instant sentence translation practice.
+
+Use today's scenario below as the source situation.
+
+Scenario title: {title}
+
+Scenario instructions:
+{scenario}
+
+Run the conversation in this order:
+1. First, come up with one short model answer in natural spoken English that fits the scenario well.
+2. Translate only that model answer into natural Japanese and say the Japanese first.
+3. Tell the user to express that Japanese in English.
+4. After the user speaks, compare their English with your hidden model answer and give concise feedback in Japanese.
+5. Then provide a better answer or the model answer in English, briefly explain the key differences in Japanese, and give the next Japanese prompt for another try.
+
+Important behavior rules:
+- Keep each target answer short: about 1 to 3 sentences.
+- The Japanese should sound natural and should preserve the intended meaning of the English model answer.
+- Do not reveal the English model answer before the user tries.
+- Judge the user's answer mainly by meaning, naturalness, and whether it fits the scenario.
+- If the user's answer is awkward but understandable, explain how to make it more natural.
+- Keep the interaction in this Japanese-to-English training loop unless the user clearly wants to stop or change topics.
+"""
+
+
 class LocalSpeaker:
     def __init__(self, logger):
         self.logger = logger
@@ -336,6 +366,7 @@ class LocalCommandDetector:
         model_path,
         wake_word,
         mimic_wake_word,
+        translate_wake_word,
         exit_word,
         logger,
         no_auto_start_wake_word=None,
@@ -353,12 +384,14 @@ class LocalCommandDetector:
         self.logger = logger
         self.wake_word = normalize_phrase(wake_word)
         self.mimic_wake_word = normalize_phrase(mimic_wake_word)
+        self.translate_wake_word = normalize_phrase(translate_wake_word)
         self.exit_word = normalize_phrase(exit_word)
         self.no_auto_start_wake_word = normalize_phrase(no_auto_start_wake_word or "")
         self.cooldown_seconds = cooldown_seconds
         self.last_trigger_at = {
             "wake": 0.0,
             "mimic_wake": 0.0,
+            "translate_wake": 0.0,
             "exit": 0.0,
             "no_auto_start_wake": 0.0,
         }
@@ -386,6 +419,8 @@ class LocalCommandDetector:
             return "exit"
         if phrase_in_text(self.mimic_wake_word, text) and self._should_emit("mimic_wake", now):
             return "mimic_wake"
+        if phrase_in_text(self.translate_wake_word, text) and self._should_emit("translate_wake", now):
+            return "translate_wake"
         if (
             phrase_in_text(self.no_auto_start_wake_word, text)
             and self._should_emit("no_auto_start_wake", now)
@@ -426,6 +461,7 @@ class AudioLoop:
         strict_turns=False,
         wake_word=DEFAULT_WAKE_WORD,
         mimic_wake_word=DEFAULT_MIMIC_WAKE_WORD,
+        translate_wake_word=DEFAULT_TRANSLATE_WAKE_WORD,
         exit_word=DEFAULT_EXIT_WORD,
         no_auto_start_wake_word=None,
         wake_word_enabled=True,
@@ -449,6 +485,7 @@ class AudioLoop:
             model_path=stt_model_path,
             wake_word=wake_word,
             mimic_wake_word=mimic_wake_word,
+            translate_wake_word=translate_wake_word,
             exit_word=exit_word,
             logger=self.logger,
             no_auto_start_wake_word=self.no_auto_start_wake_word,
@@ -569,6 +606,8 @@ class AudioLoop:
             return None
         if session_mode == "mimic":
             return build_mimic_mode_prompt(self.daily_prompt)
+        if session_mode == "translate":
+            return build_translate_mode_prompt(self.daily_prompt)
         return self.daily_prompt["prompt"]
 
     def _get_idle_sound_command(self):
@@ -611,7 +650,8 @@ class AudioLoop:
             return
 
         try:
-            if platform.system() == "Windows":
+            system_name = platform.system()
+            if system_name == "Windows":
                 creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
                     subprocess, "CREATE_NEW_PROCESS_GROUP", 0
                 )
@@ -623,11 +663,32 @@ class AudioLoop:
                 )
                 self._status("idle sound playback started in detached helper")
                 return
-            process = await asyncio.create_subprocess_exec(*command)
-            await process.wait()
-            self._status(f"idle sound playback finished with code {process.returncode}")
+            subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            self._status(f"idle sound playback started with {command[0]}")
         except Exception as exc:  # pragma: no cover - environment dependent
             self._status(f"idle sound playback failed: {exc}", level="warning")
+
+    def _background_task_done(self, name, task):
+        if task.cancelled():
+            self.logger.info("background task cancelled: %s", name)
+            return
+        exc = task.exception()
+        if exc is None:
+            self.logger.info("background task finished: %s", name)
+            return
+        self.logger.exception("background task failed: %s", name, exc_info=exc)
+        self._status(f"background task failed: {name}: {exc}", level="error")
+
+    def _start_background_task(self, background_tasks, coro, name):
+        task = asyncio.create_task(coro, name=name)
+        task.add_done_callback(lambda finished: self._background_task_done(name, finished))
+        background_tasks.append(task)
+        return task
 
     def _get_frame(self, cap):
         ret, frame = cap.read()
@@ -843,6 +904,10 @@ class AudioLoop:
                 if self.state == "idle":
                     self._status("mimic wake word detected from voice; session_mode=mimic")
                     await self.control_queue.put(("wake", "mimic", "voice"))
+            elif command == "translate_wake":
+                if self.state == "idle":
+                    self._status("translate wake word detected from voice; session_mode=translate")
+                    await self.control_queue.put(("wake", "translate", "voice"))
             elif command == "no_auto_start_wake":
                 if self.state == "idle" and not self.auto_start:
                     self._status("no-auto-start wake word detected from voice; session_mode=silent")
@@ -907,6 +972,10 @@ class AudioLoop:
             if self.state == "idle" and normalized == self.detector.mimic_wake_word:
                 self._status("mimic wake word detected from text; session_mode=mimic")
                 await self.control_queue.put(("wake", "mimic", "text"))
+                continue
+            if self.state == "idle" and normalized == self.detector.translate_wake_word:
+                self._status("translate wake word detected from text; session_mode=translate")
+                await self.control_queue.put(("wake", "translate", "text"))
                 continue
             if (
                 self.state == "idle"
@@ -1076,6 +1145,7 @@ class AudioLoop:
                 startup_message = (
                     f"Idle. Say {self.detector.wake_word} to start with today's prompt,"
                     f" say {self.detector.mimic_wake_word} for mimic mode,"
+                    f" say {self.detector.translate_wake_word} for translate mode,"
                     f" or say {self.detector.no_auto_start_wake_word} to start without it."
                     f" Say {self.detector.exit_word} to return to idle."
                 )
@@ -1083,13 +1153,14 @@ class AudioLoop:
                 startup_message = (
                     f"Idle. Say {self.detector.wake_word} to start,"
                     f" say {self.detector.mimic_wake_word} for mimic mode,"
+                    f" say {self.detector.translate_wake_word} for translate mode,"
                     f" and say {self.detector.exit_word} to return to idle."
                 )
             await self._announce(startup_message)
 
-            background_tasks.append(asyncio.create_task(self.listen_microphone()))
+            self._start_background_task(background_tasks, self.listen_microphone(), "listen_microphone")
             if self.enable_text_input:
-                background_tasks.append(asyncio.create_task(self.send_text()))
+                self._start_background_task(background_tasks, self.send_text(), "send_text")
 
             if not self.wake_word_enabled:
                 self._status("wake word disabled at startup; starting session immediately")
@@ -1186,6 +1257,12 @@ if __name__ == "__main__":
         help="Phrase that starts mimic mode with a model answer and imitation feedback.",
     )
     parser.add_argument(
+        "--translate-wake-word",
+        type=str,
+        default=DEFAULT_TRANSLATE_WAKE_WORD,
+        help="Phrase that starts Japanese-to-English translation practice based on today's prompt.",
+    )
+    parser.add_argument(
         "--exit-word",
         type=str,
         default=DEFAULT_EXIT_WORD,
@@ -1223,6 +1300,7 @@ if __name__ == "__main__":
         strict_turns=args.strict_turns,
         wake_word=args.wake_word,
         mimic_wake_word=args.mimic_wake_word,
+        translate_wake_word=args.translate_wake_word,
         exit_word=args.exit_word,
         no_auto_start_wake_word=args.no_auto_start_wake_word,
         wake_word_enabled=(not args.no_wake_word),
