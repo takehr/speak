@@ -49,6 +49,7 @@ uv run python speak.py --no-auto-start --no-auto-start-wake-word "start talking"
 Auto-start scenarios are loaded from `./prompts/*.md`.
 The app picks one markdown file per day based on the current date, so the same day always uses the same scenario.
 At startup, the selected scenario is shown in the console as `[prompt] ...`.
+The prompt list is also reloaded whenever a session starts, so edits under `./prompts` are picked up without restarting the app.
 
 Current starter set:
 - conference discussion / Q&A

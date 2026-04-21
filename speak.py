@@ -604,6 +604,21 @@ class AudioLoop:
         self.logger.info("daily prompt: %s", message)
         print(message)
 
+    def _reload_daily_prompt(self):
+        previous_prompt = getattr(self, "daily_prompt", None)
+        self.prompt_scenarios = load_prompt_scenarios()
+        self.daily_prompt = select_daily_prompt(self.prompt_scenarios)
+
+        if previous_prompt is None:
+            return
+
+        if (
+            previous_prompt["path"] != self.daily_prompt["path"]
+            or previous_prompt["title"] != self.daily_prompt["title"]
+            or previous_prompt["prompt"] != self.daily_prompt["prompt"]
+        ):
+            self._show_daily_prompt()
+
     def _build_opening_prompt(self, session_mode):
         if session_mode == "silent":
             return None
@@ -1128,6 +1143,7 @@ class AudioLoop:
             self.logger.info("start_session ignored in state=%s reason=%s", self.state, reason)
             return
 
+        self._reload_daily_prompt()
         self.logger.info(
             "start_session requested: reason=%s session_mode=%s",
             reason,
