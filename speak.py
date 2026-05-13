@@ -511,7 +511,8 @@ class AudioLoop:
         self._last_audio_play_log = 0.0
         self._last_mic_health_log = 0.0
         self._last_out_queue_full_log = 0.0
-        self._out_queue_full_since = None
+        self._out_queue_pressure_since = None
+        self._session_failure = None
         self._stdin_reader = None
         self._stdin_read_transport = None
 
@@ -530,13 +531,19 @@ class AudioLoop:
         getattr(self.logger, level)("%s", text)
         print(f"[status] {text}")
 
+    def _mark_out_queue_pressure(self):
+        if self._out_queue_pressure_since is None:
+            self._out_queue_pressure_since = self._loop_time()
+
+    def _clear_out_queue_pressure(self):
+        self._out_queue_pressure_since = None
+
     async def _enqueue_realtime_message(self, message):
         if self.out_queue is None or self.state != "active":
             return False
 
         while self.out_queue.full():
-            if self._out_queue_full_since is None:
-                self._out_queue_full_since = self._loop_time()
+            self._mark_out_queue_pressure()
 
             try:
                 dropped = self.out_queue.get_nowait()
@@ -550,10 +557,17 @@ class AudioLoop:
                     level="warning",
                 )
 
-        if not self.out_queue.full():
-            self._out_queue_full_since = None
-
-        self.out_queue.put_nowait(message)
+        try:
+            self.out_queue.put_nowait(message)
+        except asyncio.QueueFull:
+            self._mark_out_queue_pressure()
+            if self._debug_every("_last_out_queue_full_log", 2.0):
+                self._status(
+                    "realtime input queue still full; dropping newest "
+                    f"{message.get('kind', 'unknown')} frame to stay responsive",
+                    level="warning",
+                )
+            return False
         return True
 
     def _read_stdin_line_blocking(self):
@@ -708,6 +722,38 @@ class AudioLoop:
         background_tasks.append(task)
         return task
 
+    def _session_task_done(self, name, task):
+        if task.cancelled():
+            self.logger.info("session task cancelled: %s", name)
+            return
+
+        exc = task.exception()
+        if exc is None:
+            if self.session_stop_event is None or self.session_stop_event.is_set():
+                self.logger.info("session task finished: %s", name)
+                return
+            error = RuntimeError(f"session task stopped unexpectedly: {name}")
+            self.logger.error("%s", error)
+            self._status(str(error), level="warning")
+            if self._session_failure is None:
+                self._session_failure = error
+        elif self._is_normal_session_close(exc):
+            self.logger.info("session task closed normally: %s", name)
+        else:
+            self.logger.exception("session task failed: %s", name, exc_info=exc)
+            self._status(f"session task failed: {name}: {exc}", level="error")
+            if self._session_failure is None:
+                self._session_failure = exc
+
+        if self.session_stop_event is not None and not self.session_stop_event.is_set():
+            self.session_stop_event.set()
+
+    def _start_session_task(self, session_tasks, coro, name):
+        task = asyncio.create_task(coro, name=name)
+        task.add_done_callback(lambda finished: self._session_task_done(name, finished))
+        session_tasks.append(task)
+        return task
+
     def _get_frame(self, cap):
         ret, frame = cap.read()
         if not ret:
@@ -815,7 +861,7 @@ class AudioLoop:
                             ),
                             timeout=REALTIME_SEND_TIMEOUT_SECONDS,
                         )
-                    self._out_queue_full_since = None
+                    self._clear_out_queue_pressure()
         except TimeoutError as exc:
             raise RuntimeError(
                 f"realtime audio send stalled for more than {REALTIME_SEND_TIMEOUT_SECONDS:.0f}s"
@@ -950,15 +996,15 @@ class AudioLoop:
             await asyncio.sleep(HEALTH_CHECK_INTERVAL_SECONDS)
             if self.session_stop_event is None or self.out_queue is None:
                 continue
-            if self._out_queue_full_since is None:
+            if self._out_queue_pressure_since is None:
                 continue
 
-            stall_for = self._loop_time() - self._out_queue_full_since
+            stall_for = self._loop_time() - self._out_queue_pressure_since
             if stall_for < OUT_QUEUE_STALL_TIMEOUT_SECONDS:
                 continue
 
             self._status(
-                "realtime send queue stalled; returning to idle to recover",
+                f"realtime send queue stalled for {stall_for:.1f}s; returning to idle to recover",
                 level="warning",
             )
             self.session_stop_event.set()
@@ -1079,9 +1125,10 @@ class AudioLoop:
         self.assistant_speaking = False
         self.audio_in_queue = None
         self.out_queue = None
-        self._out_queue_full_since = None
+        self._clear_out_queue_pressure()
         self.session = None
         self.session_stop_event = None
+        self._session_failure = None
         self.session_task = None
         self._set_state("idle")
 
@@ -1095,24 +1142,27 @@ class AudioLoop:
             f"search_enabled={not self.auto_start}"
         )
         self.session_stop_event = asyncio.Event()
+        self._session_failure = None
         session_tasks = []
         try:
             async with get_client().aio.live.connect(model=MODEL, config=self.live_config) as session:
                 self.session = session
                 self.audio_in_queue = asyncio.Queue()
                 self.out_queue = asyncio.Queue(maxsize=5)
-                self._out_queue_full_since = None
+                self._clear_out_queue_pressure()
                 self._set_state("active")
 
-                session_tasks.append(asyncio.create_task(self.send_realtime()))
-                session_tasks.append(asyncio.create_task(self.receive_audio()))
-                session_tasks.append(asyncio.create_task(self.play_audio()))
-                session_tasks.append(asyncio.create_task(self.monitor_session_health()))
+                self._start_session_task(session_tasks, self.send_realtime(), "send_realtime")
+                self._start_session_task(session_tasks, self.receive_audio(), "receive_audio")
+                self._start_session_task(session_tasks, self.play_audio(), "play_audio")
+                self._start_session_task(
+                    session_tasks, self.monitor_session_health(), "monitor_session_health"
+                )
 
                 if self.video_mode == "camera":
-                    session_tasks.append(asyncio.create_task(self.get_frames()))
+                    self._start_session_task(session_tasks, self.get_frames(), "get_frames")
                 elif self.video_mode == "screen":
-                    session_tasks.append(asyncio.create_task(self.get_screen()))
+                    self._start_session_task(session_tasks, self.get_screen(), "get_screen")
 
                 if opening_prompt is not None:
                     self._status(
@@ -1127,6 +1177,8 @@ class AudioLoop:
                     self._status("session started without opening prompt")
 
                 await self.session_stop_event.wait()
+                if self._session_failure is not None:
+                    raise self._session_failure
         except asyncio.CancelledError:
             self.logger.info("session cancelled while state=%s", self.state)
             self._status("session cancelled")
