@@ -88,6 +88,7 @@ In this mode, Gemini should:
 - ask the user to express it in English
 - give feedback in Japanese about meaning and naturalness
 - keep the user on the same sentence until it becomes natural enough, then move on
+- continue for at least 10 completed sentences before wrapping up
 
 Default translate wake word: `translate`
 
