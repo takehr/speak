@@ -69,6 +69,9 @@ The full markdown content is sent as the opening prompt when auto-start is enabl
 When you start with `--no-auto-start`, Gemini connects without sending the first turn.
 In this mode, the Live session also enables the Google Search tool. Pass
 `--no-search` only when you want a plain voice session.
+The app uses local RMS-based voice activity detection and sends explicit
+activity start/end signals to Gemini. If speech is not detected, lower
+`--vad-start-rms` (for example `--vad-start-rms 30`).
 If you also set `--no-auto-start-wake-word`, you get two idle startup paths:
 - `--wake-word`: start with today's prompt
 - `--mimic-wake-word`: start mimic mode with a model answer first

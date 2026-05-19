@@ -50,6 +50,9 @@ CHUNK_SIZE = 1024
 REALTIME_SEND_TIMEOUT_SECONDS = 10.0
 OUT_QUEUE_STALL_TIMEOUT_SECONDS = 10.0
 HEALTH_CHECK_INTERVAL_SECONDS = 1.0
+USER_SPEECH_START_RMS = 45.0
+USER_SPEECH_END_RMS = 25.0
+USER_SPEECH_SILENCE_SECONDS = 0.8
 
 DEFAULT_MODEL = os.environ.get(
     "GEMINI_LIVE_MODEL",
@@ -116,7 +119,10 @@ def build_live_config(enable_search=False):
             )
         ),
         realtime_input_config=types.RealtimeInputConfig(
-            turn_coverage="TURN_INCLUDES_ALL_INPUT"
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                disabled=True
+            ),
+            turn_coverage="TURN_INCLUDES_ALL_INPUT",
         ),
         context_window_compression=types.ContextWindowCompressionConfig(
             trigger_tokens=25600,
@@ -488,6 +494,9 @@ class AudioLoop:
         stt_model_path=DEFAULT_STT_MODEL_PATH,
         model=DEFAULT_MODEL,
         enable_search=None,
+        vad_start_rms=USER_SPEECH_START_RMS,
+        vad_end_rms=USER_SPEECH_END_RMS,
+        vad_silence_seconds=USER_SPEECH_SILENCE_SECONDS,
     ):
         self.video_mode = video_mode
         self.auto_start = auto_start
@@ -499,6 +508,9 @@ class AudioLoop:
         self.enable_search = (
             (not self.auto_start) if enable_search is None else enable_search
         )
+        self.vad_start_rms = vad_start_rms
+        self.vad_end_rms = vad_end_rms
+        self.vad_silence_seconds = vad_silence_seconds
         self.no_auto_start_wake_word = normalize_phrase(no_auto_start_wake_word or "")
         self.prompt_scenarios = load_prompt_scenarios()
         self.daily_prompt = select_daily_prompt(self.prompt_scenarios)
@@ -525,6 +537,9 @@ class AudioLoop:
         self.session_stop_event = None
         self.input_task = None
         self.assistant_speaking = False
+        self.assistant_audio_streaming = False
+        self.user_activity_active = False
+        self._last_user_voice_at = 0.0
         self.running = True
         self.state = "idle"
         self.control_queue = asyncio.Queue()
@@ -533,6 +548,7 @@ class AudioLoop:
         self._last_receive_chunk_log = 0.0
         self._last_audio_play_log = 0.0
         self._last_mic_health_log = 0.0
+        self._last_suppressed_speech_log = 0.0
         self._last_out_queue_full_log = 0.0
         self._out_queue_pressure_since = None
         self._session_failure = None
@@ -876,6 +892,20 @@ class AudioLoop:
                             ),
                             timeout=REALTIME_SEND_TIMEOUT_SECONDS,
                         )
+                    elif msg.get("kind") == "activity_start":
+                        await asyncio.wait_for(
+                            self.session.send_realtime_input(
+                                activity_start=types.ActivityStart()
+                            ),
+                            timeout=REALTIME_SEND_TIMEOUT_SECONDS,
+                        )
+                    elif msg.get("kind") == "activity_end":
+                        await asyncio.wait_for(
+                            self.session.send_realtime_input(
+                                activity_end=types.ActivityEnd()
+                            ),
+                            timeout=REALTIME_SEND_TIMEOUT_SECONDS,
+                        )
                     elif msg.get("kind") == "video":
                         await asyncio.wait_for(
                             self.session.send_realtime_input(
@@ -919,6 +949,7 @@ class AudioLoop:
                     for part in iter_response_parts(response):
                         if part.inline_data and isinstance(part.inline_data.data, bytes):
                             self.assistant_speaking = True
+                            self.assistant_audio_streaming = True
                             if self.audio_in_queue is not None:
                                 self.audio_in_queue.put_nowait(part.inline_data.data)
                             continue
@@ -927,10 +958,13 @@ class AudioLoop:
 
                 self._status("Gemini turn complete")
 
-                self.assistant_speaking = False
+                self.assistant_audio_streaming = False
                 if not self.strict_turns and self.audio_in_queue is not None:
                     while not self.audio_in_queue.empty():
                         self.audio_in_queue.get_nowait()
+                    self.assistant_speaking = False
+                elif self.audio_in_queue is None or self.audio_in_queue.empty():
+                    self.assistant_speaking = False
         except Exception as exc:
             if self._is_normal_session_close(exc):
                 self.logger.info("receive_audio closed normally: %s", exc)
@@ -956,6 +990,12 @@ class AudioLoop:
                     pending = self.audio_in_queue.qsize() if self.audio_in_queue is not None else 0
                     self._status(f"playing model audio locally; pending_audio_chunks={pending}")
                 await asyncio.to_thread(stream.write, bytestream)
+                if (
+                    self.audio_in_queue is not None
+                    and self.audio_in_queue.empty()
+                    and not self.assistant_audio_streaming
+                ):
+                    self.assistant_speaking = False
         finally:
             self._status("closing local speaker stream")
             await asyncio.to_thread(stream.close)
@@ -984,8 +1024,8 @@ class AudioLoop:
 
         while self.running:
             data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
+            rms = self._pcm16_rms(data)
             if self._debug_every("_last_mic_health_log", 5.0):
-                rms = self._pcm16_rms(data)
                 detector_state = "speaking" if self.assistant_speaking else "listening"
                 self._status(
                     f"microphone loop alive; state={self.state}; detector={detector_state}; rms={rms:.0f}"
@@ -1015,15 +1055,53 @@ class AudioLoop:
                 self._status("exit word detected from voice")
                 await self.control_queue.put(("sleep", None, "voice"))
 
-            if self.out_queue is not None and self.state == "active" and not (
-                self.strict_turns and self.assistant_speaking
-            ):
+            can_stream_audio = (
+                self.out_queue is not None
+                and self.state == "active"
+                and not (self.strict_turns and self.assistant_speaking)
+            )
+            if can_stream_audio:
+                now = self._loop_time()
+                if not self.user_activity_active and rms >= self.vad_start_rms:
+                    self.user_activity_active = True
+                    self._last_user_voice_at = now
+                    self._status(f"user speech started; rms={rms:.0f}")
+                    await self._enqueue_realtime_message({"kind": "activity_start"})
+                elif self.user_activity_active and rms >= self.vad_end_rms:
+                    self._last_user_voice_at = now
+
+                if (
+                    self.user_activity_active
+                    and rms < self.vad_end_rms
+                    and now - self._last_user_voice_at >= self.vad_silence_seconds
+                ):
+                    self.user_activity_active = False
+                    self._status("user speech ended; sending activity_end")
+                    await self._enqueue_realtime_message({"kind": "activity_end"})
+
                 await self._enqueue_realtime_message(
                     {
                         "kind": "audio",
                         "data": data,
                         "mime_type": f"audio/pcm;rate={SEND_SAMPLE_RATE}",
                     }
+                )
+                continue
+
+            if self.user_activity_active:
+                self.user_activity_active = False
+
+            if (
+                self.state == "active"
+                and self.strict_turns
+                and self.assistant_speaking
+                and rms >= self.vad_start_rms
+                and self._debug_every("_last_suppressed_speech_log", 2.0)
+            ):
+                self._status(
+                    "user speech detected while Gemini audio is playing; "
+                    "not sending because --strict-turns is enabled",
+                    level="warning",
                 )
 
     async def monitor_session_health(self):
@@ -1092,7 +1170,7 @@ class AudioLoop:
                 while self.strict_turns and self.assistant_speaking:
                     await asyncio.sleep(0.05)
                 self._status("sending text turn to Gemini")
-                await self.session.send_realtime_input(text=text or ".")
+                await self._send_realtime_text_turn(text)
                 self._status("text turn sent")
 
     def _is_recoverable_gemini_error(self, exc):
@@ -1114,6 +1192,11 @@ class AudioLoop:
             return True
         message = normalize_phrase(str(exc))
         return message in {"1000 none", "1000 ok"} or "connection closed ok" in message
+
+    async def _send_realtime_text_turn(self, text):
+        await self.session.send_realtime_input(activity_start=types.ActivityStart())
+        await self.session.send_realtime_input(text=text or ".")
+        await self.session.send_realtime_input(activity_end=types.ActivityEnd())
 
     async def _report_session_error(self, exc):
         message = str(exc).strip() or exc.__class__.__name__
@@ -1179,6 +1262,8 @@ class AudioLoop:
                     self.logger.exception("session task cleanup failure: %s", exc)
 
         self.assistant_speaking = False
+        self.assistant_audio_streaming = False
+        self.user_activity_active = False
         self.audio_in_queue = None
         self.out_queue = None
         self._clear_out_queue_pressure()
@@ -1228,7 +1313,7 @@ class AudioLoop:
                     self._status(
                         f"sending opening prompt: {self.daily_prompt['title']} ({session_mode})"
                     )
-                    await self.session.send_realtime_input(text=opening_prompt)
+                    await self._send_realtime_text_turn(opening_prompt)
                     self._status("opening prompt sent")
                 else:
                     self._status("session started without opening prompt")
@@ -1434,6 +1519,24 @@ if __name__ == "__main__":
         action="store_true",
         help="Explicitly disable Google Search grounding for Live sessions.",
     )
+    parser.add_argument(
+        "--vad-start-rms",
+        type=float,
+        default=USER_SPEECH_START_RMS,
+        help="RMS level that starts a user speech activity.",
+    )
+    parser.add_argument(
+        "--vad-end-rms",
+        type=float,
+        default=USER_SPEECH_END_RMS,
+        help="RMS level below which silence can end a user speech activity.",
+    )
+    parser.add_argument(
+        "--vad-silence-seconds",
+        type=float,
+        default=USER_SPEECH_SILENCE_SECONDS,
+        help="Seconds of low RMS before ending a user speech activity.",
+    )
 
     args = parser.parse_args()
 
@@ -1462,6 +1565,9 @@ if __name__ == "__main__":
         stt_model_path=args.stt_model_path,
         model=args.model,
         enable_search=enable_search,
+        vad_start_rms=args.vad_start_rms,
+        vad_end_rms=args.vad_end_rms,
+        vad_silence_seconds=args.vad_silence_seconds,
     )
     try:
         asyncio.run(main.run())
