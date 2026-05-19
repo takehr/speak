@@ -51,7 +51,10 @@ REALTIME_SEND_TIMEOUT_SECONDS = 10.0
 OUT_QUEUE_STALL_TIMEOUT_SECONDS = 10.0
 HEALTH_CHECK_INTERVAL_SECONDS = 1.0
 
-DEFAULT_MODEL = os.environ.get("GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview")
+DEFAULT_MODEL = os.environ.get(
+    "GEMINI_LIVE_MODEL",
+    "models/gemini-2.5-flash-native-audio-preview-12-2025",
+)
 DEFAULT_MODE = "camera"
 DEFAULT_WAKE_WORD = "gemini"
 DEFAULT_MIMIC_WAKE_WORD = "copy mode"
@@ -81,6 +84,12 @@ RECOVERABLE_ERROR_PATTERNS = (
     "temporarily unavailable",
     "timeout",
     "unavailable",
+)
+QUOTA_OR_BILLING_ERROR_PATTERNS = (
+    "billing",
+    "quota",
+    "resource exhausted",
+    "spending cap",
 )
 UNSUPPORTED_LIVE_OPERATION_PATTERNS = (
     "1008",
@@ -1090,6 +1099,10 @@ class AudioLoop:
         message = normalize_phrase(str(exc))
         return any(pattern in message for pattern in RECOVERABLE_ERROR_PATTERNS)
 
+    def _is_quota_or_billing_error(self, exc):
+        message = normalize_phrase(str(exc))
+        return any(pattern in message for pattern in QUOTA_OR_BILLING_ERROR_PATTERNS)
+
     def _is_unsupported_live_operation(self, exc):
         message = normalize_phrase(str(exc))
         return any(pattern in message for pattern in UNSUPPORTED_LIVE_OPERATION_PATTERNS)
@@ -1104,6 +1117,14 @@ class AudioLoop:
 
     async def _report_session_error(self, exc):
         message = str(exc).strip() or exc.__class__.__name__
+        if self._is_quota_or_billing_error(exc):
+            await self._announce(
+                "Gemini quota or billing limit was reached. Returning to idle. "
+                f"You can say {self.detector.wake_word} to retry later.",
+                level="error",
+            )
+            self.logger.error("Gemini quota or billing error: %s", message)
+            return
         if self._is_recoverable_gemini_error(exc):
             await self._announce(
                 f"Gemini server error. Returning to idle. You can say {self.detector.wake_word} to reconnect.",
@@ -1224,6 +1245,8 @@ class AudioLoop:
         except Exception as exc:
             self.logger.exception("session failure")
             self._status(f"session failure: {exc}", level="error")
+            if self.state in {"connecting", "active"}:
+                self._set_state("closing")
             await self._report_session_error(exc)
         finally:
             await self._cleanup_session(session_tasks)
@@ -1409,7 +1432,7 @@ if __name__ == "__main__":
     search_group.add_argument(
         "--no-search",
         action="store_true",
-        help="Disable Google Search grounding for Live sessions.",
+        help="Explicitly disable Google Search grounding for Live sessions.",
     )
 
     args = parser.parse_args()
