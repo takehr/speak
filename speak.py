@@ -51,7 +51,7 @@ REALTIME_SEND_TIMEOUT_SECONDS = 10.0
 OUT_QUEUE_STALL_TIMEOUT_SECONDS = 10.0
 HEALTH_CHECK_INTERVAL_SECONDS = 1.0
 
-MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+DEFAULT_MODEL = os.environ.get("GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview")
 DEFAULT_MODE = "camera"
 DEFAULT_WAKE_WORD = "gemini"
 DEFAULT_MIMIC_WAKE_WORD = "copy mode"
@@ -70,14 +70,24 @@ RECOVERABLE_ERROR_PATTERNS = (
     "503",
     "504",
     "deadline",
+    "billing",
     "internal",
+    "quota",
     "rate limit",
     "resource exhausted",
     "server",
     "service unavailable",
+    "spending cap",
     "temporarily unavailable",
     "timeout",
     "unavailable",
+)
+UNSUPPORTED_LIVE_OPERATION_PATTERNS = (
+    "1008",
+    "not implemented",
+    "not supported",
+    "not enabled",
+    "policy violation",
 )
 
 client = None
@@ -86,9 +96,8 @@ client = None
 def build_live_config(enable_search=False):
     tools = None
     if enable_search:
-        tools = [types.Tool(google_search=types.GoogleSearch())]
+        tools = [{"google_search": {}}]
 
-    # LiveConnectConfig（system_instruction は role='system' が安定しやすいです）
     return types.LiveConnectConfig(
         response_modalities=["AUDIO"],
         media_resolution="MEDIA_RESOLUTION_MEDIUM",
@@ -104,13 +113,8 @@ def build_live_config(enable_search=False):
             trigger_tokens=25600,
             sliding_window=types.SlidingWindow(target_tokens=12800),
         ),
-        system_instruction=types.Content(
-            parts=[
-                types.Part.from_text(
-                    text="Follow the user's roleplay setup. Keep responses natural and conversational."
-                )
-            ],
-            role="system",
+        system_instruction=(
+            "Follow the user's roleplay setup. Keep responses natural and conversational."
         ),
         tools=tools,
     )
@@ -205,10 +209,6 @@ def iter_response_parts(response):
     ):
         return []
     return response.server_content.model_turn.parts
-
-
-def make_user_text_turn(text):
-    return types.Content(role="user", parts=[types.Part.from_text(text=text)])
 
 
 def build_mimic_mode_prompt(daily_prompt):
@@ -477,6 +477,8 @@ class AudioLoop:
         no_auto_start_wake_word=None,
         wake_word_enabled=True,
         stt_model_path=DEFAULT_STT_MODEL_PATH,
+        model=DEFAULT_MODEL,
+        enable_search=None,
     ):
         self.video_mode = video_mode
         self.auto_start = auto_start
@@ -484,10 +486,14 @@ class AudioLoop:
         self.mic_index = mic_index
         self.strict_turns = strict_turns
         self.wake_word_enabled = wake_word_enabled
+        self.model = model
+        self.enable_search = (
+            (not self.auto_start) if enable_search is None else enable_search
+        )
         self.no_auto_start_wake_word = normalize_phrase(no_auto_start_wake_word or "")
         self.prompt_scenarios = load_prompt_scenarios()
         self.daily_prompt = select_daily_prompt(self.prompt_scenarios)
-        self.live_config = build_live_config(enable_search=(not self.auto_start))
+        self.live_config = build_live_config(enable_search=self.enable_search)
 
         self.logger = configure_logging()
         self.speaker = LocalSpeaker(self.logger)
@@ -608,7 +614,7 @@ class AudioLoop:
         self.logger.info("state %s -> %s", previous_state, new_state)
         print(f"[state] {previous_state} -> {new_state}")
         self.state = new_state
-        if previous_state == "active" and new_state == "idle":
+        if previous_state in {"active", "closing"} and new_state == "idle":
             try:
                 asyncio.get_running_loop().create_task(self._play_idle_sound())
             except RuntimeError:
@@ -777,7 +783,7 @@ class AudioLoop:
 
         image_bytes = image_io.read()
         return {
-            "kind": "media",
+            "kind": "video",
             "data": image_bytes,
             "mime_type": "image/jpeg",
         }
@@ -818,7 +824,7 @@ class AudioLoop:
 
         image_bytes = image_io.read()
         return {
-            "kind": "media",
+            "kind": "video",
             "data": image_bytes,
             "mime_type": "image/jpeg",
         }
@@ -843,6 +849,8 @@ class AudioLoop:
                     await asyncio.sleep(0.01)
                     continue
                 msg = await self.out_queue.get()
+                if self.state != "active":
+                    continue
                 if self.session is not None:
                     if self._debug_every("_last_realtime_send_log", 5.0):
                         queue_size = self.out_queue.qsize() if self.out_queue is not None else 0
@@ -853,6 +861,16 @@ class AudioLoop:
                         await asyncio.wait_for(
                             self.session.send_realtime_input(
                                 audio=types.Blob(
+                                    data=msg["data"],
+                                    mime_type=msg["mime_type"],
+                                )
+                            ),
+                            timeout=REALTIME_SEND_TIMEOUT_SECONDS,
+                        )
+                    elif msg.get("kind") == "video":
+                        await asyncio.wait_for(
+                            self.session.send_realtime_input(
+                                video=types.Blob(
                                     data=msg["data"],
                                     mime_type=msg["mime_type"],
                                 )
@@ -1065,15 +1083,16 @@ class AudioLoop:
                 while self.strict_turns and self.assistant_speaking:
                     await asyncio.sleep(0.05)
                 self._status("sending text turn to Gemini")
-                await self.session.send_client_content(
-                    turns=make_user_text_turn(text or "."),
-                    turn_complete=True,
-                )
+                await self.session.send_realtime_input(text=text or ".")
                 self._status("text turn sent")
 
     def _is_recoverable_gemini_error(self, exc):
         message = normalize_phrase(str(exc))
         return any(pattern in message for pattern in RECOVERABLE_ERROR_PATTERNS)
+
+    def _is_unsupported_live_operation(self, exc):
+        message = normalize_phrase(str(exc))
+        return any(pattern in message for pattern in UNSUPPORTED_LIVE_OPERATION_PATTERNS)
 
     def _is_normal_session_close(self, exc):
         if isinstance(exc, asyncio.CancelledError):
@@ -1091,6 +1110,14 @@ class AudioLoop:
                 level="error",
             )
             self.logger.error("recoverable Gemini error: %s", message)
+            return
+        if self._is_unsupported_live_operation(exc):
+            await self._announce(
+                "Gemini Live API rejected this model or session configuration. "
+                f"Returning to idle. Details: {message}",
+                level="error",
+            )
+            self.logger.error("unsupported Gemini Live operation: %s", message)
             return
 
         await self._announce(
@@ -1145,15 +1172,19 @@ class AudioLoop:
         opening_prompt = self._build_opening_prompt(session_mode)
         self._status(
             "opening Gemini live session; "
+            f"model={self.model}; "
             f"session_mode={session_mode}; "
             f"send_opening_prompt={opening_prompt is not None}; "
-            f"search_enabled={not self.auto_start}"
+            f"search_enabled={self.enable_search}"
         )
         self.session_stop_event = asyncio.Event()
         self._session_failure = None
         session_tasks = []
         try:
-            async with get_client().aio.live.connect(model=MODEL, config=self.live_config) as session:
+            async with get_client().aio.live.connect(
+                model=self.model,
+                config=self.live_config,
+            ) as session:
                 self.session = session
                 self.audio_in_queue = asyncio.Queue()
                 self.out_queue = asyncio.Queue(maxsize=5)
@@ -1176,15 +1207,14 @@ class AudioLoop:
                     self._status(
                         f"sending opening prompt: {self.daily_prompt['title']} ({session_mode})"
                     )
-                    await self.session.send_client_content(
-                        turns=make_user_text_turn(opening_prompt),
-                        turn_complete=True,
-                    )
+                    await self.session.send_realtime_input(text=opening_prompt)
                     self._status("opening prompt sent")
                 else:
                     self._status("session started without opening prompt")
 
                 await self.session_stop_event.wait()
+                if self.state == "active":
+                    self._set_state("closing")
                 if self._session_failure is not None:
                     raise self._session_failure
         except asyncio.CancelledError:
@@ -1364,12 +1394,35 @@ if __name__ == "__main__":
         default=os.environ.get("VOSK_MODEL_PATH", DEFAULT_STT_MODEL_PATH),
         help="Path to the local Vosk speech recognition model directory.",
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=DEFAULT_MODEL,
+        help="Gemini Live API model name. Defaults to GEMINI_LIVE_MODEL or the current Live preview.",
+    )
+    search_group = parser.add_mutually_exclusive_group()
+    search_group.add_argument(
+        "--search",
+        action="store_true",
+        help="Enable Google Search grounding for Live sessions.",
+    )
+    search_group.add_argument(
+        "--no-search",
+        action="store_true",
+        help="Disable Google Search grounding for Live sessions.",
+    )
 
     args = parser.parse_args()
 
     if args.list_mics:
         list_input_devices()
         raise SystemExit(0)
+
+    enable_search = None
+    if args.search:
+        enable_search = True
+    elif args.no_search:
+        enable_search = False
 
     main = AudioLoop(
         video_mode=args.mode,
@@ -1384,6 +1437,8 @@ if __name__ == "__main__":
         no_auto_start_wake_word=args.no_auto_start_wake_word,
         wake_word_enabled=(not args.no_wake_word),
         stt_model_path=args.stt_model_path,
+        model=args.model,
+        enable_search=enable_search,
     )
     try:
         asyncio.run(main.run())

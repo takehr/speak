@@ -45,6 +45,12 @@ uv run python speak.py --wake-word "gemini" --mimic-wake-word "copy mode" --exit
 uv run python speak.py --no-auto-start --no-auto-start-wake-word "start talking" --wake-word "gemini" --exit-word "see you" --stt-model-path "./vosk-model-small-en-us-0.15" --mic-index 4 --strict-turns --mode none
 ```
 
+By default the app uses `gemini-3.1-flash-live-preview`. To try another Live API
+model without editing the script, pass `--model ...` or set `GEMINI_LIVE_MODEL`.
+`--no-auto-start` still enables Google Search grounding by default; pass
+`--no-search` if your project rejects the search tool or you want a plain voice
+session.
+
 ### daily prompts
 Auto-start scenarios are loaded from `./prompts/*.md`.
 The app picks one markdown file per day based on the current date, so the same day always uses the same scenario.
