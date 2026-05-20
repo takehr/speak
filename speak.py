@@ -292,7 +292,9 @@ Important behavior rules:
 - Do not say the practice is finished, wrap up, or ask whether to stop before at least 10 completed sentences.
 - Count only sentences that the user has corrected to a sufficiently natural English version.
 - Keep track of the Japanese prompts and accepted English answers during the session.
-- For the quick review test, choose several of the practiced Japanese prompts, ask them again in Japanese, and have the user translate them into English without hints.
+- For the quick review test, use this exact format: you say one practiced Japanese prompt, then wait for the user to translate it into English.
+- Do not say the English answer before the user attempts the quick review item.
+- After feedback on one quick review item, say the next practiced Japanese prompt and wait for the user's English translation.
 - During the quick review test, give brief Japanese feedback after each answer and correct the user if needed.
 - Only wrap up after completing the quick review test.
 - Keep the interaction in this Japanese-to-English training loop unless the user clearly wants to stop or change topics.
@@ -421,15 +423,22 @@ class LocalCommandDetector:
             "exit": 0.0,
             "no_auto_start_wake": 0.0,
         }
+        self.last_phrase_trigger_at = {}
         self.model = vosk.Model(str(resolved))
         self.recognizer = vosk.KaldiRecognizer(self.model, SEND_SAMPLE_RATE)
         self.recognizer.SetWords(False)
 
-    def _should_emit(self, command, now):
+    def _should_emit(self, command, now, phrase=None):
         last = self.last_trigger_at.get(command, 0.0)
         if now - last < self.cooldown_seconds:
             return False
+        if phrase:
+            last_phrase = self.last_phrase_trigger_at.get(phrase, 0.0)
+            if now - last_phrase < self.cooldown_seconds:
+                return False
         self.last_trigger_at[command] = now
+        if phrase:
+            self.last_phrase_trigger_at[phrase] = now
         return True
 
     def _extract_text(self, payload):
@@ -439,24 +448,32 @@ class LocalCommandDetector:
             return ""
         return normalize_phrase(data.get("text") or data.get("partial") or "")
 
-    def _match_command(self, text):
+    def _commands_for_state(self, state):
+        if state == "idle":
+            return (
+                ("mimic_wake", self.mimic_wake_word),
+                ("translate_wake", self.translate_wake_word),
+                ("no_auto_start_wake", self.no_auto_start_wake_word),
+                ("wake", self.wake_word),
+            )
+        if state in {"connecting", "active"}:
+            return (("exit", self.exit_word),)
+        return (
+            ("exit", self.exit_word),
+            ("mimic_wake", self.mimic_wake_word),
+            ("translate_wake", self.translate_wake_word),
+            ("no_auto_start_wake", self.no_auto_start_wake_word),
+            ("wake", self.wake_word),
+        )
+
+    def _match_command(self, text, state=None):
         now = asyncio.get_running_loop().time()
-        if phrase_in_text(self.exit_word, text) and self._should_emit("exit", now):
-            return "exit"
-        if phrase_in_text(self.mimic_wake_word, text) and self._should_emit("mimic_wake", now):
-            return "mimic_wake"
-        if phrase_in_text(self.translate_wake_word, text) and self._should_emit("translate_wake", now):
-            return "translate_wake"
-        if (
-            phrase_in_text(self.no_auto_start_wake_word, text)
-            and self._should_emit("no_auto_start_wake", now)
-        ):
-            return "no_auto_start_wake"
-        if phrase_in_text(self.wake_word, text) and self._should_emit("wake", now):
-            return "wake"
+        for command, phrase in self._commands_for_state(state):
+            if phrase_in_text(phrase, text) and self._should_emit(command, now, phrase):
+                return command
         return None
 
-    def feed(self, pcm_bytes):
+    def feed(self, pcm_bytes, state=None):
         payloads = []
         if self.recognizer.AcceptWaveform(pcm_bytes):
             payloads.append(self.recognizer.Result())
@@ -467,7 +484,7 @@ class LocalCommandDetector:
             text = self._extract_text(payload)
             if not text:
                 continue
-            command = self._match_command(text)
+            command = self._match_command(text, state=state)
             if command is None:
                 continue
             self.logger.info("Detected %s phrase from transcript=%r", command, text)
@@ -539,6 +556,7 @@ class AudioLoop:
         self.assistant_speaking = False
         self.assistant_audio_streaming = False
         self.user_activity_active = False
+        self._user_activity_started_at = 0.0
         self._last_user_voice_at = 0.0
         self.running = True
         self.state = "idle"
@@ -1031,7 +1049,7 @@ class AudioLoop:
                     f"microphone loop alive; state={self.state}; detector={detector_state}; rms={rms:.0f}"
                 )
 
-            command = self.detector.feed(data)
+            command = self.detector.feed(data, state=self.state)
             if command == "wake":
                 if self.state == "idle":
                     session_mode = "prompt" if self.no_auto_start_wake_word and not self.auto_start else "default"
@@ -1064,6 +1082,7 @@ class AudioLoop:
                 now = self._loop_time()
                 if not self.user_activity_active and rms >= self.vad_start_rms:
                     self.user_activity_active = True
+                    self._user_activity_started_at = now
                     self._last_user_voice_at = now
                     self._status(f"user speech started; rms={rms:.0f}")
                     await self._enqueue_realtime_message({"kind": "activity_start"})
@@ -1075,8 +1094,12 @@ class AudioLoop:
                     and rms < self.vad_end_rms
                     and now - self._last_user_voice_at >= self.vad_silence_seconds
                 ):
+                    duration = now - self._user_activity_started_at
                     self.user_activity_active = False
-                    self._status("user speech ended; sending activity_end")
+                    self._user_activity_started_at = 0.0
+                    self._status(
+                        f"user speech ended; duration={duration:.1f}s; sending activity_end"
+                    )
                     await self._enqueue_realtime_message({"kind": "activity_end"})
 
                 await self._enqueue_realtime_message(
@@ -1090,6 +1113,7 @@ class AudioLoop:
 
             if self.user_activity_active:
                 self.user_activity_active = False
+                self._user_activity_started_at = 0.0
 
             if (
                 self.state == "active"
@@ -1264,6 +1288,7 @@ class AudioLoop:
         self.assistant_speaking = False
         self.assistant_audio_streaming = False
         self.user_activity_active = False
+        self._user_activity_started_at = 0.0
         self.audio_in_queue = None
         self.out_queue = None
         self._clear_out_queue_pressure()
