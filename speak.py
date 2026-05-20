@@ -53,6 +53,8 @@ HEALTH_CHECK_INTERVAL_SECONDS = 1.0
 USER_SPEECH_START_RMS = 45.0
 USER_SPEECH_END_RMS = 25.0
 USER_SPEECH_SILENCE_SECONDS = 0.8
+VOICE_COMMAND_ECHO_GRACE_SECONDS = 2.0
+WAKE_COMMAND_MIN_CONFIDENCE = 0.65
 
 DEFAULT_MODEL = os.environ.get(
     "GEMINI_LIVE_MODEL",
@@ -389,6 +391,8 @@ class LocalSoundPlayer:
 
 
 class LocalCommandDetector:
+    WAKE_COMMANDS = {"wake", "mimic_wake", "translate_wake", "no_auto_start_wake"}
+
     def __init__(
         self,
         model_path,
@@ -399,6 +403,7 @@ class LocalCommandDetector:
         logger,
         no_auto_start_wake_word=None,
         cooldown_seconds=1.5,
+        wake_min_confidence=WAKE_COMMAND_MIN_CONFIDENCE,
     ):
         if vosk is None:
             raise RuntimeError("vosk is required. Install it with `pip install vosk`.")
@@ -416,6 +421,7 @@ class LocalCommandDetector:
         self.exit_word = normalize_phrase(exit_word)
         self.no_auto_start_wake_word = normalize_phrase(no_auto_start_wake_word or "")
         self.cooldown_seconds = cooldown_seconds
+        self.wake_min_confidence = wake_min_confidence
         self.last_trigger_at = {
             "wake": 0.0,
             "mimic_wake": 0.0,
@@ -426,7 +432,7 @@ class LocalCommandDetector:
         self.last_phrase_trigger_at = {}
         self.model = vosk.Model(str(resolved))
         self.recognizer = vosk.KaldiRecognizer(self.model, SEND_SAMPLE_RATE)
-        self.recognizer.SetWords(False)
+        self.recognizer.SetWords(True)
 
     def _should_emit(self, command, now, phrase=None):
         last = self.last_trigger_at.get(command, 0.0)
@@ -441,12 +447,50 @@ class LocalCommandDetector:
             self.last_phrase_trigger_at[phrase] = now
         return True
 
-    def _extract_text(self, payload):
+    def reset(self):
+        if hasattr(self.recognizer, "Reset"):
+            self.recognizer.Reset()
+
+    def _extract_result(self, payload):
         try:
             data = json.loads(payload)
         except json.JSONDecodeError:
-            return ""
-        return normalize_phrase(data.get("text") or data.get("partial") or "")
+            return "", False, []
+        is_final = "text" in data
+        raw_text = (data.get("text") if is_final else data.get("partial")) or ""
+        text = normalize_phrase(raw_text)
+        return text, is_final, data.get("result") or []
+
+    def _words_with_confidence(self, words):
+        normalized_words = []
+        for word_info in words:
+            tokens = normalize_phrase(word_info.get("word") or "").split()
+            if not tokens:
+                continue
+            try:
+                confidence = float(word_info.get("conf", 0.0))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            normalized_words.extend((token, confidence) for token in tokens)
+        return normalized_words
+
+    def _phrase_confident_enough(self, phrase, words):
+        normalized_words = self._words_with_confidence(words)
+        phrase_tokens = phrase.split()
+        window = len(phrase_tokens)
+        if not normalized_words or window == 0 or window > len(normalized_words):
+            return False
+
+        word_tokens = [token for token, _confidence in normalized_words]
+        for index in range(len(word_tokens) - window + 1):
+            if word_tokens[index : index + window] != phrase_tokens:
+                continue
+            confidences = [
+                confidence
+                for _token, confidence in normalized_words[index : index + window]
+            ]
+            return min(confidences) >= self.wake_min_confidence
+        return False
 
     def _commands_for_state(self, state):
         if state == "idle":
@@ -466,10 +510,22 @@ class LocalCommandDetector:
             ("wake", self.wake_word),
         )
 
-    def _match_command(self, text, state=None):
+    def _match_command(self, text, state=None, is_final=False, words=None):
         now = asyncio.get_running_loop().time()
         for command, phrase in self._commands_for_state(state):
-            if phrase_in_text(phrase, text) and self._should_emit(command, now, phrase):
+            if not phrase_in_text(phrase, text):
+                continue
+            if command in self.WAKE_COMMANDS:
+                if not is_final:
+                    continue
+                if words and not self._phrase_confident_enough(phrase, words):
+                    self.logger.info(
+                        "Ignored low-confidence %s phrase from transcript=%r",
+                        command,
+                        text,
+                    )
+                    continue
+            if self._should_emit(command, now, phrase):
                 return command
         return None
 
@@ -481,15 +537,25 @@ class LocalCommandDetector:
             payloads.append(self.recognizer.PartialResult())
 
         for payload in payloads:
-            text = self._extract_text(payload)
+            text, is_final, words = self._extract_result(payload)
             if not text:
                 continue
-            command = self._match_command(text, state=state)
+            command = self._match_command(
+                text,
+                state=state,
+                is_final=is_final,
+                words=words,
+            )
             if command is None:
                 continue
-            self.logger.info("Detected %s phrase from transcript=%r", command, text)
-            if hasattr(self.recognizer, "Reset"):
-                self.recognizer.Reset()
+            result_type = "final" if is_final else "partial"
+            self.logger.info(
+                "Detected %s phrase from %s transcript=%r",
+                command,
+                result_type,
+                text,
+            )
+            self.reset()
             return command
         return None
 
@@ -514,6 +580,7 @@ class AudioLoop:
         vad_start_rms=USER_SPEECH_START_RMS,
         vad_end_rms=USER_SPEECH_END_RMS,
         vad_silence_seconds=USER_SPEECH_SILENCE_SECONDS,
+        wake_min_confidence=WAKE_COMMAND_MIN_CONFIDENCE,
     ):
         self.video_mode = video_mode
         self.auto_start = auto_start
@@ -528,6 +595,7 @@ class AudioLoop:
         self.vad_start_rms = vad_start_rms
         self.vad_end_rms = vad_end_rms
         self.vad_silence_seconds = vad_silence_seconds
+        self.wake_min_confidence = wake_min_confidence
         self.no_auto_start_wake_word = normalize_phrase(no_auto_start_wake_word or "")
         self.prompt_scenarios = load_prompt_scenarios()
         self.daily_prompt = select_daily_prompt(self.prompt_scenarios)
@@ -544,6 +612,7 @@ class AudioLoop:
             exit_word=exit_word,
             logger=self.logger,
             no_auto_start_wake_word=self.no_auto_start_wake_word,
+            wake_min_confidence=self.wake_min_confidence,
         )
 
         self.audio_stream = None
@@ -572,6 +641,8 @@ class AudioLoop:
         self._session_failure = None
         self._stdin_reader = None
         self._stdin_read_transport = None
+        self.local_output_active = False
+        self._voice_commands_suppressed_until = 0.0
 
     def _loop_time(self):
         return asyncio.get_running_loop().time()
@@ -587,6 +658,21 @@ class AudioLoop:
     def _status(self, text, level="info"):
         getattr(self.logger, level)("%s", text)
         print(f"[status] {text}")
+
+    def _suppress_voice_commands(self, seconds, reason):
+        until = self._loop_time() + seconds
+        self._voice_commands_suppressed_until = max(
+            self._voice_commands_suppressed_until,
+            until,
+        )
+        self.detector.reset()
+        self.logger.info("voice commands suppressed for %.1fs: %s", seconds, reason)
+
+    def _voice_commands_suppressed(self):
+        return (
+            self.local_output_active
+            or self._loop_time() < self._voice_commands_suppressed_until
+        )
 
     def _mark_out_queue_pressure(self):
         if self._out_queue_pressure_since is None:
@@ -658,6 +744,10 @@ class AudioLoop:
         print(f"[state] {previous_state} -> {new_state}")
         self.state = new_state
         if previous_state in {"active", "closing"} and new_state == "idle":
+            self._suppress_voice_commands(
+                VOICE_COMMAND_ECHO_GRACE_SECONDS,
+                "session returned to idle",
+            )
             try:
                 asyncio.get_running_loop().create_task(self._play_idle_sound())
             except RuntimeError:
@@ -666,7 +756,16 @@ class AudioLoop:
     async def _announce(self, text, level="info"):
         getattr(self.logger, level)("%s", text)
         print(text)
-        await self.speaker.speak(text)
+        self.local_output_active = True
+        self.detector.reset()
+        try:
+            await self.speaker.speak(text)
+        finally:
+            self.local_output_active = False
+            self._suppress_voice_commands(
+                VOICE_COMMAND_ECHO_GRACE_SECONDS,
+                "local announcement finished",
+            )
 
     def _show_daily_prompt(self):
         path = self.daily_prompt["path"]
@@ -730,15 +829,17 @@ class AudioLoop:
             self._status(f"idle sound not found: {IDLE_SOUND_PATH}", level="warning")
             return
         self._status(f"playing idle sound: {IDLE_SOUND_PATH.name}")
-        if await self.sound_player.play(IDLE_SOUND_PATH):
-            self._status("idle sound playback finished")
-            return
-        command = self._get_idle_sound_command()
-        if command is None:
-            self._status("idle sound skipped: no supported audio player is available", level="warning")
-            return
-
+        self.local_output_active = True
+        self.detector.reset()
         try:
+            if await self.sound_player.play(IDLE_SOUND_PATH):
+                self._status("idle sound playback finished")
+                return
+            command = self._get_idle_sound_command()
+            if command is None:
+                self._status("idle sound skipped: no supported audio player is available", level="warning")
+                return
+
             system_name = platform.system()
             if system_name == "Windows":
                 creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
@@ -761,6 +862,12 @@ class AudioLoop:
             self._status(f"idle sound playback started with {command[0]}")
         except Exception as exc:  # pragma: no cover - environment dependent
             self._status(f"idle sound playback failed: {exc}", level="warning")
+        finally:
+            self.local_output_active = False
+            self._suppress_voice_commands(
+                VOICE_COMMAND_ECHO_GRACE_SECONDS,
+                "local idle sound finished",
+            )
 
     def _background_task_done(self, name, task):
         if task.cancelled():
@@ -1049,7 +1156,11 @@ class AudioLoop:
                     f"microphone loop alive; state={self.state}; detector={detector_state}; rms={rms:.0f}"
                 )
 
-            command = self.detector.feed(data, state=self.state)
+            if self._voice_commands_suppressed():
+                self.detector.reset()
+                command = None
+            else:
+                command = self.detector.feed(data, state=self.state)
             if command == "wake":
                 if self.state == "idle":
                     session_mode = "prompt" if self.no_auto_start_wake_word and not self.auto_start else "default"
@@ -1522,6 +1633,15 @@ if __name__ == "__main__":
         help="Start a session immediately, then fall back to wake-word mode after returning to idle.",
     )
     parser.add_argument(
+        "--wake-min-confidence",
+        type=float,
+        default=WAKE_COMMAND_MIN_CONFIDENCE,
+        help=(
+            "Minimum Vosk word confidence required for wake phrases. "
+            "Raise it to reduce false starts; lower it if wake words are missed."
+        ),
+    )
+    parser.add_argument(
         "--stt-model-path",
         type=str,
         default=os.environ.get("VOSK_MODEL_PATH", DEFAULT_STT_MODEL_PATH),
@@ -1565,6 +1685,9 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    if not 0.0 <= args.wake_min_confidence <= 1.0:
+        parser.error("--wake-min-confidence must be between 0.0 and 1.0.")
+
     if args.list_mics:
         list_input_devices()
         raise SystemExit(0)
@@ -1593,6 +1716,7 @@ if __name__ == "__main__":
         vad_start_rms=args.vad_start_rms,
         vad_end_rms=args.vad_end_rms,
         vad_silence_seconds=args.vad_silence_seconds,
+        wake_min_confidence=args.wake_min_confidence,
     )
     try:
         asyncio.run(main.run())

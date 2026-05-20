@@ -41,9 +41,14 @@ uv pip install vosk
 uv run python speak.py
 uv run python speak.py --list-mics
 uv run python speak.py --wake-word "gemini" --exit-word "see you" --stt-model-path "./vosk-model-small-en-us-0.15" --mic-index 4 --strict-turns --mode none
+uv run python speak.py --wake-min-confidence 0.75 --wake-word "gemini" --exit-word "see you" --stt-model-path "./vosk-model-small-en-us-0.15" --mic-index 4 --strict-turns --mode none
 uv run python speak.py --wake-word "gemini" --mimic-wake-word "copy mode" --exit-word "see you" --stt-model-path "./vosk-model-small-en-us-0.15" --mic-index 4 --strict-turns --mode none
 uv run python speak.py --no-auto-start --no-auto-start-wake-word "start talking" --wake-word "gemini" --exit-word "see you" --stt-model-path "./vosk-model-small-en-us-0.15" --mic-index 4 --strict-turns --mode none
 ```
+
+`--wake-min-confidence` controls how confident Vosk must be before an idle wake
+phrase is accepted. The default is `0.65`; try `0.75` or higher if the app
+starts without you saying the wake word.
 
 By default the app uses `models/gemini-2.5-flash-native-audio-preview-12-2025`,
 because this project uses Google Search grounding in no-auto-start sessions.
