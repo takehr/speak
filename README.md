@@ -98,12 +98,12 @@ Default mimic wake word: `copy mode`
 `--translate-wake-word` starts an instant sentence translation session based on today's daily prompt.
 In this mode, Gemini should:
 - prepare a polished model answer internally
-- say the Japanese translation of that answer first
+- say the numbered Japanese translation of that answer first
 - ask the user to express it in English
 - give feedback in Japanese about meaning and naturalness
 - keep the user on the same sentence until it becomes natural enough, then move on
 - continue for at least 10 completed sentences before wrapping up
-- finish with a quick review test where Gemini says a practiced Japanese prompt and the user translates it into English
+- finish with a numbered quick review test where Gemini says each practiced Japanese prompt and the user translates it into English
 
 Default translate wake word: `translate`
 
