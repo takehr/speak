@@ -1515,7 +1515,7 @@ class AudioLoop:
                     f" say {self.detector.translate_wake_word} for translate mode,"
                     f" and say {self.detector.exit_word} to return to idle."
                 )
-            await self._announce(startup_message)
+            self._status(startup_message)
 
             self._start_background_task(background_tasks, self.listen_microphone(), "listen_microphone")
             if self.enable_text_input:
