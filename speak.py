@@ -634,6 +634,7 @@ class AudioLoop:
         self._user_activity_started_at = 0.0
         self._last_user_voice_at = 0.0
         self.running = True
+        self.shutdown_requested = False
         self.state = "idle"
         self.control_queue = asyncio.Queue()
         self._last_realtime_send_log = 0.0
@@ -882,9 +883,17 @@ class AudioLoop:
         exc = task.exception()
         if exc is None:
             self.logger.info("background task finished: %s", name)
-            return
-        self.logger.exception("background task failed: %s", name, exc_info=exc)
-        self._status(f"background task failed: {name}: {exc}", level="error")
+        else:
+            self.logger.exception("background task failed: %s", name, exc_info=exc)
+            self._status(f"background task failed: {name}: {exc}", level="error")
+
+        if name == "listen_microphone" and self.running:
+            reason = f"{name}: {exc}" if exc is not None else f"{name} stopped"
+            self._status(
+                "wake-word listener stopped unexpectedly; scheduling application recovery",
+                level="warning",
+            )
+            self.control_queue.put_nowait(("restart", None, reason))
 
     def _start_background_task(self, background_tasks, coro, name):
         task = asyncio.create_task(coro, name=name)
@@ -1414,6 +1423,10 @@ class AudioLoop:
         self._session_failure = None
         self.session_task = None
         self._set_state("idle")
+        if self.running and not self.shutdown_requested:
+            self._status(
+                f"ready for wake word; say {self.detector.wake_word} to start a new session"
+            )
 
     async def _run_session(self, session_mode):
         self._set_state("connecting")
@@ -1494,7 +1507,28 @@ class AudioLoop:
         )
         self.session_task = asyncio.create_task(self._run_session(session_mode))
 
-    async def run(self):
+    def _prepare_application_restart(self):
+        self.running = True
+        self.state = "idle"
+        self.control_queue = asyncio.Queue()
+        self.audio_stream = None
+        self.session = None
+        self.audio_in_queue = None
+        self.out_queue = None
+        self.session_task = None
+        self.session_stop_event = None
+        self.input_task = None
+        self.assistant_speaking = False
+        self.assistant_audio_streaming = False
+        self.user_activity_active = False
+        self._user_activity_started_at = 0.0
+        self._last_user_voice_at = 0.0
+        self._clear_out_queue_pressure()
+        self._session_failure = None
+        self.local_output_active = False
+        self.detector.reset()
+
+    async def _run_application(self):
         background_tasks = []
         try:
             self.logger.info("application start")
@@ -1539,11 +1573,19 @@ class AudioLoop:
                 elif command == "sleep":
                     await self.stop_session(reason)
                 elif command == "quit":
+                    self.shutdown_requested = True
                     self.running = False
                     await self.stop_session(reason)
+                elif command == "restart":
+                    self._status(
+                        f"restarting application after background failure: {reason}",
+                        level="warning",
+                    )
+                    return
                 else:
                     self.logger.warning("unknown command=%s reason=%s", command, reason)
         except KeyboardInterrupt:
+            self.shutdown_requested = True
             self.logger.info("keyboard interrupt")
             self._status("keyboard interrupt received")
         except Exception as exc:
@@ -1566,6 +1608,19 @@ class AudioLoop:
                     self.audio_stream.close()
             self.logger.info("application stop")
             self._status("application stop")
+
+    async def run(self):
+        while not self.shutdown_requested:
+            await self._run_application()
+            if self.shutdown_requested:
+                break
+
+            self._status(
+                "application loop stopped unexpectedly; restarting wake-word listener",
+                level="warning",
+            )
+            self._prepare_application_restart()
+            await asyncio.sleep(1.0)
 
 
 if __name__ == "__main__":
