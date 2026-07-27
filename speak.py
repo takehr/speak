@@ -54,7 +54,9 @@ USER_SPEECH_START_RMS = 45.0
 USER_SPEECH_END_RMS = 25.0
 USER_SPEECH_SILENCE_SECONDS = 0.8
 VOICE_COMMAND_ECHO_GRACE_SECONDS = 2.0
-WAKE_COMMAND_MIN_CONFIDENCE = 0.65
+WAKE_COMMAND_MIN_CONFIDENCE = 0.80
+WAKE_COMMAND_MIN_RMS = 45.0
+WAKE_COMMAND_MIN_ACTIVE_SECONDS = 0.25
 
 DEFAULT_MODEL = os.environ.get(
     "GEMINI_LIVE_MODEL",
@@ -410,6 +412,8 @@ class LocalCommandDetector:
         no_auto_start_wake_word=None,
         cooldown_seconds=1.5,
         wake_min_confidence=WAKE_COMMAND_MIN_CONFIDENCE,
+        wake_min_rms=WAKE_COMMAND_MIN_RMS,
+        wake_min_active_seconds=WAKE_COMMAND_MIN_ACTIVE_SECONDS,
     ):
         if vosk is None:
             raise RuntimeError("vosk is required. Install it with `pip install vosk`.")
@@ -428,6 +432,10 @@ class LocalCommandDetector:
         self.no_auto_start_wake_word = normalize_phrase(no_auto_start_wake_word or "")
         self.cooldown_seconds = cooldown_seconds
         self.wake_min_confidence = wake_min_confidence
+        self.wake_min_rms = wake_min_rms
+        self.wake_min_active_seconds = wake_min_active_seconds
+        self._wake_active_run_seconds = 0.0
+        self._wake_max_active_seconds = 0.0
         self.last_trigger_at = {
             "wake": 0.0,
             "mimic_wake": 0.0,
@@ -456,6 +464,22 @@ class LocalCommandDetector:
     def reset(self):
         if hasattr(self.recognizer, "Reset"):
             self.recognizer.Reset()
+        self._reset_wake_activity()
+
+    def _reset_wake_activity(self):
+        self._wake_active_run_seconds = 0.0
+        self._wake_max_active_seconds = 0.0
+
+    def _observe_wake_activity(self, pcm_bytes, rms):
+        frame_seconds = (len(pcm_bytes) // 2) / SEND_SAMPLE_RATE
+        if rms >= self.wake_min_rms:
+            self._wake_active_run_seconds += frame_seconds
+            self._wake_max_active_seconds = max(
+                self._wake_max_active_seconds,
+                self._wake_active_run_seconds,
+            )
+        else:
+            self._wake_active_run_seconds = 0.0
 
     def _extract_result(self, payload):
         try:
@@ -524,18 +548,29 @@ class LocalCommandDetector:
             if command in self.WAKE_COMMANDS:
                 if not is_final:
                     continue
-                if words and not self._phrase_confident_enough(phrase, words):
+                if not self._phrase_confident_enough(phrase, words):
                     self.logger.info(
                         "Ignored low-confidence %s phrase from transcript=%r",
                         command,
                         text,
                     )
                     continue
+                if self._wake_max_active_seconds < self.wake_min_active_seconds:
+                    self.logger.info(
+                        "Ignored short %s phrase from transcript=%r; "
+                        "active_audio=%.3fs required=%.3fs",
+                        command,
+                        text,
+                        self._wake_max_active_seconds,
+                        self.wake_min_active_seconds,
+                    )
+                    continue
             if self._should_emit(command, now, phrase):
                 return command
         return None
 
-    def feed(self, pcm_bytes, state=None):
+    def feed(self, pcm_bytes, state=None, rms=0.0):
+        self._observe_wake_activity(pcm_bytes, rms)
         payloads = []
         if self.recognizer.AcceptWaveform(pcm_bytes):
             payloads.append(self.recognizer.Result())
@@ -563,6 +598,8 @@ class LocalCommandDetector:
             )
             self.reset()
             return command
+        if any(self._extract_result(payload)[1] for payload in payloads):
+            self._reset_wake_activity()
         return None
 
 
@@ -587,6 +624,8 @@ class AudioLoop:
         vad_end_rms=USER_SPEECH_END_RMS,
         vad_silence_seconds=USER_SPEECH_SILENCE_SECONDS,
         wake_min_confidence=WAKE_COMMAND_MIN_CONFIDENCE,
+        wake_min_rms=WAKE_COMMAND_MIN_RMS,
+        wake_min_active_seconds=WAKE_COMMAND_MIN_ACTIVE_SECONDS,
     ):
         self.video_mode = video_mode
         self.auto_start = auto_start
@@ -602,6 +641,8 @@ class AudioLoop:
         self.vad_end_rms = vad_end_rms
         self.vad_silence_seconds = vad_silence_seconds
         self.wake_min_confidence = wake_min_confidence
+        self.wake_min_rms = wake_min_rms
+        self.wake_min_active_seconds = wake_min_active_seconds
         self.no_auto_start_wake_word = normalize_phrase(no_auto_start_wake_word or "")
         self.prompt_scenarios = load_prompt_scenarios()
         self.daily_prompt = select_daily_prompt(self.prompt_scenarios)
@@ -619,6 +660,8 @@ class AudioLoop:
             logger=self.logger,
             no_auto_start_wake_word=self.no_auto_start_wake_word,
             wake_min_confidence=self.wake_min_confidence,
+            wake_min_rms=self.wake_min_rms,
+            wake_min_active_seconds=self.wake_min_active_seconds,
         )
 
         self.audio_stream = None
@@ -1175,7 +1218,7 @@ class AudioLoop:
                 self.detector.reset()
                 command = None
             else:
-                command = self.detector.feed(data, state=self.state)
+                command = self.detector.feed(data, state=self.state, rms=rms)
             if command == "wake":
                 if self.state == "idle":
                     session_mode = "prompt" if self.no_auto_start_wake_word and not self.auto_start else "default"
@@ -1703,6 +1746,24 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--wake-min-rms",
+        type=float,
+        default=WAKE_COMMAND_MIN_RMS,
+        help=(
+            "Minimum RMS counted as wake-phrase audio. "
+            "Raise it to reject quiet background noise."
+        ),
+    )
+    parser.add_argument(
+        "--wake-min-active-seconds",
+        type=float,
+        default=WAKE_COMMAND_MIN_ACTIVE_SECONDS,
+        help=(
+            "Minimum continuous active audio required for a wake phrase. "
+            "Raise it to reject short impact sounds such as keyboard clicks."
+        ),
+    )
+    parser.add_argument(
         "--stt-model-path",
         type=str,
         default=os.environ.get("VOSK_MODEL_PATH", DEFAULT_STT_MODEL_PATH),
@@ -1748,6 +1809,10 @@ if __name__ == "__main__":
 
     if not 0.0 <= args.wake_min_confidence <= 1.0:
         parser.error("--wake-min-confidence must be between 0.0 and 1.0.")
+    if args.wake_min_rms < 0.0:
+        parser.error("--wake-min-rms must be non-negative.")
+    if args.wake_min_active_seconds < 0.0:
+        parser.error("--wake-min-active-seconds must be non-negative.")
 
     if args.list_mics:
         list_input_devices()
@@ -1778,6 +1843,8 @@ if __name__ == "__main__":
         vad_end_rms=args.vad_end_rms,
         vad_silence_seconds=args.vad_silence_seconds,
         wake_min_confidence=args.wake_min_confidence,
+        wake_min_rms=args.wake_min_rms,
+        wake_min_active_seconds=args.wake_min_active_seconds,
     )
     try:
         asyncio.run(main.run())

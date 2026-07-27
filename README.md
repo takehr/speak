@@ -41,14 +41,18 @@ uv pip install vosk
 uv run python speak.py
 uv run python speak.py --list-mics
 uv run python speak.py --wake-word "gemini" --exit-word "see you" --stt-model-path "./vosk-model-small-en-us-0.15" --mic-index 4 --strict-turns --mode none
-uv run python speak.py --wake-min-confidence 0.75 --wake-word "gemini" --exit-word "see you" --stt-model-path "./vosk-model-small-en-us-0.15" --mic-index 4 --strict-turns --mode none
+uv run python speak.py --wake-min-confidence 0.85 --wake-min-active-seconds 0.30 --wake-word "hello" --exit-word "see you" --stt-model-path "./vosk-model-small-en-us-0.15" --mic-index 4 --strict-turns --mode none
 uv run python speak.py --wake-word "gemini" --mimic-wake-word "copy mode" --exit-word "see you" --stt-model-path "./vosk-model-small-en-us-0.15" --mic-index 4 --strict-turns --mode none
 uv run python speak.py --no-auto-start --no-auto-start-wake-word "start talking" --wake-word "gemini" --exit-word "see you" --stt-model-path "./vosk-model-small-en-us-0.15" --mic-index 4 --strict-turns --mode none
 ```
 
 `--wake-min-confidence` controls how confident Vosk must be before an idle wake
-phrase is accepted. The default is `0.65`; try `0.75` or higher if the app
-starts without you saying the wake word.
+phrase is accepted. The default is `0.80`; try `0.85` or higher if the app
+starts without you saying the wake word. Wake phrases also require `0.25`
+seconds of continuous audio above `--wake-min-rms 45` by default, which rejects
+short impact sounds such as keyboard clicks. If clicks still trigger it, try
+`--wake-min-active-seconds 0.30`. If softly spoken wake phrases are missed,
+lower `--wake-min-rms` or `--wake-min-active-seconds`.
 
 By default the app uses `models/gemini-2.5-flash-native-audio-preview-12-2025`,
 because this project uses Google Search grounding in no-auto-start sessions.
