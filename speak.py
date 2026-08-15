@@ -57,6 +57,9 @@ VOICE_COMMAND_ECHO_GRACE_SECONDS = 2.0
 WAKE_COMMAND_MIN_CONFIDENCE = 0.80
 WAKE_COMMAND_MIN_RMS = 45.0
 WAKE_COMMAND_MIN_ACTIVE_SECONDS = 0.25
+DEFAULT_DAILY_START_TIME = dt.time(hour=20, minute=0)
+DEFAULT_SCHEDULED_RESPONSE_TIMEOUT_SECONDS = 60.0
+DAILY_START_CATCH_UP_SECONDS = 60.0
 
 DEFAULT_MODEL = os.environ.get(
     "GEMINI_LIVE_MODEL",
@@ -145,6 +148,26 @@ def normalize_phrase(text):
     lowered = text.lower()
     normalized = re.sub(r"[^a-z0-9\s]", " ", lowered)
     return " ".join(normalized.split())
+
+
+def parse_clock_time(value):
+    match = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", value or "")
+    if match is None:
+        raise argparse.ArgumentTypeError("time must use 24-hour HH:MM format")
+    return dt.time(hour=int(match.group(1)), minute=int(match.group(2)))
+
+
+def next_daily_occurrence(now, scheduled_time):
+    candidate = now.replace(
+        hour=scheduled_time.hour,
+        minute=scheduled_time.minute,
+        second=0,
+        microsecond=0,
+    )
+    catch_up_window = dt.timedelta(seconds=DAILY_START_CATCH_UP_SECONDS)
+    if now <= candidate + catch_up_window:
+        return candidate
+    return candidate + dt.timedelta(days=1)
 
 
 def phrase_in_text(phrase, text):
@@ -626,6 +649,8 @@ class AudioLoop:
         wake_min_confidence=WAKE_COMMAND_MIN_CONFIDENCE,
         wake_min_rms=WAKE_COMMAND_MIN_RMS,
         wake_min_active_seconds=WAKE_COMMAND_MIN_ACTIVE_SECONDS,
+        daily_start_time=DEFAULT_DAILY_START_TIME,
+        scheduled_response_timeout=DEFAULT_SCHEDULED_RESPONSE_TIMEOUT_SECONDS,
     ):
         self.video_mode = video_mode
         self.auto_start = auto_start
@@ -643,6 +668,8 @@ class AudioLoop:
         self.wake_min_confidence = wake_min_confidence
         self.wake_min_rms = wake_min_rms
         self.wake_min_active_seconds = wake_min_active_seconds
+        self.daily_start_time = daily_start_time
+        self.scheduled_response_timeout = scheduled_response_timeout
         self.no_auto_start_wake_word = normalize_phrase(no_auto_start_wake_word or "")
         self.prompt_scenarios = load_prompt_scenarios()
         self.daily_prompt = select_daily_prompt(self.prompt_scenarios)
@@ -689,6 +716,8 @@ class AudioLoop:
         self._last_out_queue_full_log = 0.0
         self._out_queue_pressure_since = None
         self._session_failure = None
+        self._scheduled_first_turn_complete_event = None
+        self._scheduled_user_response_event = None
         self._stdin_reader = None
         self._stdin_read_transport = None
         self.local_output_active = False
@@ -1141,6 +1170,12 @@ class AudioLoop:
 
                 self._status("Gemini turn complete")
 
+                if (
+                    self._scheduled_first_turn_complete_event is not None
+                    and not self._scheduled_first_turn_complete_event.is_set()
+                ):
+                    self._scheduled_first_turn_complete_event.set()
+
                 self.assistant_audio_streaming = False
                 if not self.strict_turns and self.audio_in_queue is not None:
                     while not self.audio_in_queue.empty():
@@ -1260,6 +1295,19 @@ class AudioLoop:
 
                 if (
                     self.user_activity_active
+                    and now - self._user_activity_started_at
+                    >= self.wake_min_active_seconds
+                    and self._scheduled_first_turn_complete_event is not None
+                    and self._scheduled_first_turn_complete_event.is_set()
+                    and self._scheduled_user_response_event is not None
+                    and not self._scheduled_user_response_event.is_set()
+                    and not self.assistant_speaking
+                ):
+                    self._scheduled_user_response_event.set()
+                    self._status("user response detected for scheduled session")
+
+                if (
+                    self.user_activity_active
                     and rms < self.vad_end_rms
                     and now - self._last_user_voice_at >= self.vad_silence_seconds
                 ):
@@ -1316,6 +1364,77 @@ class AudioLoop:
             self.session_stop_event.set()
             return
 
+    async def monitor_scheduled_response(self):
+        first_turn_event = self._scheduled_first_turn_complete_event
+        user_response_event = self._scheduled_user_response_event
+        stop_event = self.session_stop_event
+        if first_turn_event is None or user_response_event is None or stop_event is None:
+            return
+
+        await first_turn_event.wait()
+        while (
+            self.running
+            and self.state == "active"
+            and self.assistant_speaking
+            and not user_response_event.is_set()
+        ):
+            await asyncio.sleep(0.05)
+
+        if user_response_event.is_set():
+            await stop_event.wait()
+            return
+
+        self._status(
+            "scheduled session waiting for user response; "
+            f"timeout={self.scheduled_response_timeout:.0f}s"
+        )
+        try:
+            await asyncio.wait_for(
+                user_response_event.wait(),
+                timeout=self.scheduled_response_timeout,
+            )
+        except TimeoutError:
+            self._status(
+                "no user response to scheduled session; returning to idle",
+                level="warning",
+            )
+            await self.control_queue.put(
+                ("sleep", None, "scheduled-no-response")
+            )
+
+        await stop_event.wait()
+
+    async def schedule_daily_session(self):
+        now = dt.datetime.now().astimezone()
+        next_run = next_daily_occurrence(now, self.daily_start_time)
+        self._status(
+            "daily normal session scheduled for "
+            f"{next_run.isoformat(timespec='minutes')}"
+        )
+
+        while self.running:
+            now = dt.datetime.now().astimezone()
+            delay = (next_run - now).total_seconds()
+            if delay > 0:
+                await asyncio.sleep(min(delay, 30.0))
+                continue
+
+            scheduled_for = next_run
+            next_run = scheduled_for + dt.timedelta(days=1)
+            if self.state == "idle":
+                self._status(
+                    "daily start time reached; starting normal conversation"
+                )
+                await self.control_queue.put(
+                    ("wake", "prompt", "daily-schedule")
+                )
+            else:
+                self._status(
+                    "daily start time reached while a session is already running; "
+                    "skipping today's scheduled start",
+                    level="warning",
+                )
+
     async def send_text(self):
         while self.running:
             print("message > ", end="", flush=True)
@@ -1362,6 +1481,12 @@ class AudioLoop:
             if self.session is not None and self.state == "active":
                 while self.strict_turns and self.assistant_speaking:
                     await asyncio.sleep(0.05)
+                if (
+                    self._scheduled_user_response_event is not None
+                    and not self._scheduled_user_response_event.is_set()
+                ):
+                    self._scheduled_user_response_event.set()
+                    self._status("text response detected for scheduled session")
                 self._status("sending text turn to Gemini")
                 await self._send_realtime_text_turn(text)
                 self._status("text turn sent")
@@ -1465,14 +1590,19 @@ class AudioLoop:
         self.session_stop_event = None
         self._session_failure = None
         self.session_task = None
+        self._scheduled_first_turn_complete_event = None
+        self._scheduled_user_response_event = None
         self._set_state("idle")
         if self.running and not self.shutdown_requested:
             self._status(
                 f"ready for wake word; say {self.detector.wake_word} to start a new session"
             )
 
-    async def _run_session(self, session_mode):
+    async def _run_session(self, session_mode, require_scheduled_response=False):
         self._set_state("connecting")
+        if require_scheduled_response:
+            self._scheduled_first_turn_complete_event = asyncio.Event()
+            self._scheduled_user_response_event = asyncio.Event()
         opening_prompt = self._build_opening_prompt(session_mode)
         self._status(
             "opening Gemini live session; "
@@ -1501,6 +1631,12 @@ class AudioLoop:
                 self._start_session_task(
                     session_tasks, self.monitor_session_health(), "monitor_session_health"
                 )
+                if require_scheduled_response:
+                    self._start_session_task(
+                        session_tasks,
+                        self.monitor_scheduled_response(),
+                        "monitor_scheduled_response",
+                    )
 
                 if self.video_mode == "camera":
                     self._start_session_task(session_tasks, self.get_frames(), "get_frames")
@@ -1548,7 +1684,12 @@ class AudioLoop:
         self._status(
             f"starting session; reason={reason}; session_mode={session_mode}"
         )
-        self.session_task = asyncio.create_task(self._run_session(session_mode))
+        self.session_task = asyncio.create_task(
+            self._run_session(
+                session_mode,
+                require_scheduled_response=(reason == "daily-schedule"),
+            )
+        )
 
     def _prepare_application_restart(self):
         self.running = True
@@ -1568,6 +1709,8 @@ class AudioLoop:
         self._last_user_voice_at = 0.0
         self._clear_out_queue_pressure()
         self._session_failure = None
+        self._scheduled_first_turn_complete_event = None
+        self._scheduled_user_response_event = None
         self.local_output_active = False
         self.detector.reset()
 
@@ -1597,6 +1740,12 @@ class AudioLoop:
             self._start_background_task(background_tasks, self.listen_microphone(), "listen_microphone")
             if self.enable_text_input:
                 self._start_background_task(background_tasks, self.send_text(), "send_text")
+            if self.daily_start_time is not None:
+                self._start_background_task(
+                    background_tasks,
+                    self.schedule_daily_session(),
+                    "schedule_daily_session",
+                )
 
             if not self.wake_word_enabled:
                 self._status("wake word disabled at startup; starting session immediately")
@@ -1764,6 +1913,31 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--daily-start-time",
+        type=parse_clock_time,
+        default=DEFAULT_DAILY_START_TIME,
+        metavar="HH:MM",
+        help=(
+            "Local time to automatically start a normal conversation each day. "
+            "Defaults to 20:00."
+        ),
+    )
+    parser.add_argument(
+        "--no-daily-start",
+        action="store_true",
+        help="Disable the daily automatic conversation start.",
+    )
+    parser.add_argument(
+        "--scheduled-response-timeout",
+        type=float,
+        default=DEFAULT_SCHEDULED_RESPONSE_TIMEOUT_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "Return a scheduled session to idle if the user does not respond "
+            "within this many seconds. Defaults to 60."
+        ),
+    )
+    parser.add_argument(
         "--stt-model-path",
         type=str,
         default=os.environ.get("VOSK_MODEL_PATH", DEFAULT_STT_MODEL_PATH),
@@ -1813,6 +1987,8 @@ if __name__ == "__main__":
         parser.error("--wake-min-rms must be non-negative.")
     if args.wake_min_active_seconds < 0.0:
         parser.error("--wake-min-active-seconds must be non-negative.")
+    if args.scheduled_response_timeout <= 0.0:
+        parser.error("--scheduled-response-timeout must be positive.")
 
     if args.list_mics:
         list_input_devices()
@@ -1845,6 +2021,8 @@ if __name__ == "__main__":
         wake_min_confidence=args.wake_min_confidence,
         wake_min_rms=args.wake_min_rms,
         wake_min_active_seconds=args.wake_min_active_seconds,
+        daily_start_time=(None if args.no_daily_start else args.daily_start_time),
+        scheduled_response_timeout=args.scheduled_response_timeout,
     )
     try:
         asyncio.run(main.run())

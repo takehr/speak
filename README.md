@@ -46,6 +46,25 @@ uv run python speak.py --wake-word "gemini" --mimic-wake-word "copy mode" --exit
 uv run python speak.py --no-auto-start --no-auto-start-wake-word "start talking" --wake-word "gemini" --exit-word "see you" --stt-model-path "./vosk-model-small-en-us-0.15" --mic-index 4 --strict-turns --mode none
 ```
 
+### daily 8 PM conversation
+
+While the app is running, it automatically starts the normal daily-prompt
+conversation at `20:00` in the computer's local time. After Gemini finishes its
+first message, the app waits up to 60 seconds for microphone activity. If nobody
+responds, it returns to idle wake-word mode automatically.
+
+```bash
+uv run python speak.py \
+  --daily-start-time 20:00 \
+  --scheduled-response-timeout 60 \
+  --mode none
+```
+
+Use `--no-daily-start` to disable the schedule. If another conversation is
+already active at 20:00, the scheduled start is skipped for that day. The app
+must stay running (for example, as the systemd service above) for the schedule
+to fire.
+
 `--wake-min-confidence` controls how confident Vosk must be before an idle wake
 phrase is accepted. The default is `0.80`; try `0.85` or higher if the app
 starts without you saying the wake word. Wake phrases also require `0.25`
