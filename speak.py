@@ -60,6 +60,10 @@ WAKE_COMMAND_MIN_ACTIVE_SECONDS = 0.25
 DEFAULT_DAILY_START_TIME = dt.time(hour=20, minute=0)
 DEFAULT_SCHEDULED_RESPONSE_TIMEOUT_SECONDS = 60.0
 DAILY_START_CATCH_UP_SECONDS = 60.0
+MICROPHONE_RETRY_SECONDS = 2.0
+AUDIO_STREAM_CLOSE_TIMEOUT_SECONDS = 2.0
+APPLICATION_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+BACKGROUND_SHUTDOWN_TIMEOUT_SECONDS = 3.0
 
 DEFAULT_MODEL = os.environ.get(
     "GEMINI_LIVE_MODEL",
@@ -815,6 +819,28 @@ class AudioLoop:
             total += sample * sample
         return math.sqrt(total / sample_count)
 
+    async def _close_microphone_stream(self):
+        stream = self.audio_stream
+        self.audio_stream = None
+        if stream is None:
+            return
+
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(stream.close),
+                timeout=AUDIO_STREAM_CLOSE_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            self._status(
+                "microphone stream close timed out; continuing recovery",
+                level="warning",
+            )
+        except Exception as exc:
+            self._status(
+                f"microphone stream close failed during recovery: {exc}",
+                level="warning",
+            )
+
     def _set_state(self, new_state):
         previous_state = self.state
         if previous_state == new_state:
@@ -1225,23 +1251,48 @@ class AudioLoop:
         else:
             mic_index = self.mic_index
 
-        self._status(f"opening microphone stream; mic_index={mic_index}")
-
-        self.audio_stream = await asyncio.to_thread(
-            pya.open,
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=SEND_SAMPLE_RATE,
-            input=True,
-            input_device_index=mic_index,
-            frames_per_buffer=CHUNK_SIZE,
-        )
-        self._status("microphone stream opened")
-
         kwargs = {"exception_on_overflow": False} if __debug__ else {}
 
         while self.running:
-            data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
+            if self.audio_stream is None:
+                self._status(f"opening microphone stream; mic_index={mic_index}")
+                try:
+                    self.audio_stream = await asyncio.to_thread(
+                        pya.open,
+                        format=FORMAT,
+                        channels=CHANNELS,
+                        rate=SEND_SAMPLE_RATE,
+                        input=True,
+                        input_device_index=mic_index,
+                        frames_per_buffer=CHUNK_SIZE,
+                    )
+                except OSError as exc:
+                    self._status(
+                        "microphone unavailable; "
+                        f"retrying in {MICROPHONE_RETRY_SECONDS:.0f}s: {exc}",
+                        level="warning",
+                    )
+                    await asyncio.sleep(MICROPHONE_RETRY_SECONDS)
+                    continue
+                self._status("microphone stream opened")
+
+            try:
+                data = await asyncio.to_thread(
+                    self.audio_stream.read,
+                    CHUNK_SIZE,
+                    **kwargs,
+                )
+            except OSError as exc:
+                self._status(
+                    "microphone stream lost; "
+                    f"retrying in {MICROPHONE_RETRY_SECONDS:.0f}s: {exc}",
+                    level="warning",
+                )
+                self.detector.reset()
+                await self._close_microphone_stream()
+                await asyncio.sleep(MICROPHONE_RETRY_SECONDS)
+                continue
+
             rms = self._pcm16_rms(data)
             if self._debug_every("_last_mic_health_log", 5.0):
                 detector_state = "speaking" if self.assistant_speaking else "listening"
@@ -1788,16 +1839,33 @@ class AudioLoop:
         finally:
             self.running = False
             self._status("application shutdown start")
-            await self.stop_session("shutdown")
+            try:
+                await asyncio.wait_for(
+                    self.stop_session("shutdown"),
+                    timeout=APPLICATION_SHUTDOWN_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                self._status(
+                    "session shutdown timed out; forcing application recovery",
+                    level="warning",
+                )
+                if self.session_task is not None:
+                    self.session_task.cancel()
             for task in background_tasks:
                 task.cancel()
-            for task in background_tasks:
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+            if background_tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*background_tasks, return_exceptions=True),
+                        timeout=BACKGROUND_SHUTDOWN_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError:
+                    self._status(
+                        "background task shutdown timed out; continuing recovery",
+                        level="warning",
+                    )
             self._close_stdin_reader()
-            if self.audio_stream is not None:
-                with contextlib.suppress(Exception):
-                    self.audio_stream.close()
+            await self._close_microphone_stream()
             self.logger.info("application stop")
             self._status("application stop")
 
