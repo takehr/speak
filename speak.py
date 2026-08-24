@@ -64,6 +64,9 @@ MICROPHONE_RETRY_SECONDS = 2.0
 AUDIO_STREAM_CLOSE_TIMEOUT_SECONDS = 2.0
 APPLICATION_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 BACKGROUND_SHUTDOWN_TIMEOUT_SECONDS = 3.0
+DEFAULT_LIVE_OPEN_TIMEOUT_SECONDS = 30.0
+DEFAULT_LIVE_CONNECT_ATTEMPTS = 3
+DEFAULT_LIVE_CONNECT_RETRY_SECONDS = 3.0
 
 DEFAULT_MODEL = os.environ.get(
     "GEMINI_LIVE_MODEL",
@@ -88,7 +91,12 @@ RECOVERABLE_ERROR_PATTERNS = (
     "504",
     "deadline",
     "billing",
+    "connection refused",
+    "getaddrinfo",
     "internal",
+    "name resolution",
+    "network is unreachable",
+    "opening handshake",
     "quota",
     "rate limit",
     "resource exhausted",
@@ -96,6 +104,8 @@ RECOVERABLE_ERROR_PATTERNS = (
     "service unavailable",
     "spending cap",
     "temporarily unavailable",
+    "temporary failure",
+    "timed out",
     "timeout",
     "unavailable",
 )
@@ -114,6 +124,7 @@ UNSUPPORTED_LIVE_OPERATION_PATTERNS = (
 )
 
 client = None
+client_connection_options = None
 
 
 def build_live_config(enable_search=False):
@@ -234,16 +245,24 @@ def select_daily_prompt(scenarios, today=None):
     return scenarios[index]
 
 
-def get_client():
-    global client
-    if client is None:
+def get_client(live_open_timeout=DEFAULT_LIVE_OPEN_TIMEOUT_SECONDS, use_proxy=True):
+    global client, client_connection_options
+    connection_options = (float(live_open_timeout), bool(use_proxy))
+    if client is None or client_connection_options != connection_options:
         api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not set.")
         client = genai.Client(
-            http_options={"api_version": "v1beta"},
+            http_options={
+                "api_version": "v1beta",
+                "async_client_args": {
+                    "open_timeout": live_open_timeout,
+                    "proxy": True if use_proxy else None,
+                },
+            },
             api_key=api_key,
         )
+        client_connection_options = connection_options
     return client
 
 
@@ -655,6 +674,10 @@ class AudioLoop:
         wake_min_active_seconds=WAKE_COMMAND_MIN_ACTIVE_SECONDS,
         daily_start_time=DEFAULT_DAILY_START_TIME,
         scheduled_response_timeout=DEFAULT_SCHEDULED_RESPONSE_TIMEOUT_SECONDS,
+        live_open_timeout=DEFAULT_LIVE_OPEN_TIMEOUT_SECONDS,
+        live_connect_attempts=DEFAULT_LIVE_CONNECT_ATTEMPTS,
+        live_connect_retry_seconds=DEFAULT_LIVE_CONNECT_RETRY_SECONDS,
+        use_websocket_proxy=True,
     ):
         self.video_mode = video_mode
         self.auto_start = auto_start
@@ -674,6 +697,10 @@ class AudioLoop:
         self.wake_min_active_seconds = wake_min_active_seconds
         self.daily_start_time = daily_start_time
         self.scheduled_response_timeout = scheduled_response_timeout
+        self.live_open_timeout = live_open_timeout
+        self.live_connect_attempts = live_connect_attempts
+        self.live_connect_retry_seconds = live_connect_retry_seconds
+        self.use_websocket_proxy = use_websocket_proxy
         self.no_auto_start_wake_word = normalize_phrase(no_auto_start_wake_word or "")
         self.prompt_scenarios = load_prompt_scenarios()
         self.daily_prompt = select_daily_prompt(self.prompt_scenarios)
@@ -1562,6 +1589,43 @@ class AudioLoop:
         message = normalize_phrase(str(exc))
         return message in {"1000 none", "1000 ok"} or "connection closed ok" in message
 
+    def _is_live_connect_retryable(self, exc):
+        if self._is_quota_or_billing_error(exc) or self._is_unsupported_live_operation(exc):
+            return False
+        return isinstance(exc, (OSError, TimeoutError)) or self._is_recoverable_gemini_error(exc)
+
+    async def _enter_live_session_with_retry(self, stack):
+        for attempt in range(1, self.live_connect_attempts + 1):
+            self._status(
+                "connecting to Gemini Live; "
+                f"attempt={attempt}/{self.live_connect_attempts}; "
+                f"open_timeout={self.live_open_timeout:.0f}s; "
+                f"proxy={'auto' if self.use_websocket_proxy else 'disabled'}"
+            )
+            try:
+                connection = get_client(
+                    live_open_timeout=self.live_open_timeout,
+                    use_proxy=self.use_websocket_proxy,
+                ).aio.live.connect(
+                    model=self.model,
+                    config=self.live_config,
+                )
+                return await stack.enter_async_context(connection)
+            except Exception as exc:
+                if (
+                    attempt >= self.live_connect_attempts
+                    or not self._is_live_connect_retryable(exc)
+                ):
+                    raise
+                self._status(
+                    "Gemini Live connection failed; "
+                    f"retrying in {self.live_connect_retry_seconds:.0f}s: {exc}",
+                    level="warning",
+                )
+                await asyncio.sleep(self.live_connect_retry_seconds)
+
+        raise RuntimeError("Gemini Live connection attempts exhausted")
+
     async def _send_realtime_text_turn(self, text):
         await self.session.send_realtime_input(activity_start=types.ActivityStart())
         await self.session.send_realtime_input(text=text or ".")
@@ -1660,16 +1724,15 @@ class AudioLoop:
             f"model={self.model}; "
             f"session_mode={session_mode}; "
             f"send_opening_prompt={opening_prompt is not None}; "
-            f"search_enabled={self.enable_search}"
+            f"search_enabled={self.enable_search}; "
+            f"open_timeout={self.live_open_timeout:.0f}s"
         )
         self.session_stop_event = asyncio.Event()
         self._session_failure = None
         session_tasks = []
         try:
-            async with get_client().aio.live.connect(
-                model=self.model,
-                config=self.live_config,
-            ) as session:
+            async with contextlib.AsyncExitStack() as session_stack:
+                session = await self._enter_live_session_with_retry(session_stack)
                 self.session = session
                 self.audio_in_queue = asyncio.Queue()
                 self.out_queue = asyncio.Queue(maxsize=5)
@@ -2017,6 +2080,32 @@ if __name__ == "__main__":
         default=DEFAULT_MODEL,
         help="Gemini Live API model name. Defaults to GEMINI_LIVE_MODEL or the current Live preview.",
     )
+    parser.add_argument(
+        "--live-open-timeout",
+        type=float,
+        default=DEFAULT_LIVE_OPEN_TIMEOUT_SECONDS,
+        metavar="SECONDS",
+        help="WebSocket opening-handshake timeout. Defaults to 30 seconds.",
+    )
+    parser.add_argument(
+        "--live-connect-attempts",
+        type=int,
+        default=DEFAULT_LIVE_CONNECT_ATTEMPTS,
+        metavar="COUNT",
+        help="Number of automatic Gemini Live connection attempts. Defaults to 3.",
+    )
+    parser.add_argument(
+        "--live-connect-retry-seconds",
+        type=float,
+        default=DEFAULT_LIVE_CONNECT_RETRY_SECONDS,
+        metavar="SECONDS",
+        help="Delay between Gemini Live connection attempts. Defaults to 3 seconds.",
+    )
+    parser.add_argument(
+        "--no-websocket-proxy",
+        action="store_true",
+        help="Bypass Windows/environment proxy settings for the Gemini Live WebSocket.",
+    )
     search_group = parser.add_mutually_exclusive_group()
     search_group.add_argument(
         "--search",
@@ -2057,6 +2146,12 @@ if __name__ == "__main__":
         parser.error("--wake-min-active-seconds must be non-negative.")
     if args.scheduled_response_timeout <= 0.0:
         parser.error("--scheduled-response-timeout must be positive.")
+    if args.live_open_timeout <= 0.0:
+        parser.error("--live-open-timeout must be positive.")
+    if args.live_connect_attempts < 1:
+        parser.error("--live-connect-attempts must be at least 1.")
+    if args.live_connect_retry_seconds < 0.0:
+        parser.error("--live-connect-retry-seconds must be non-negative.")
 
     if args.list_mics:
         list_input_devices()
@@ -2091,6 +2186,10 @@ if __name__ == "__main__":
         wake_min_active_seconds=args.wake_min_active_seconds,
         daily_start_time=(None if args.no_daily_start else args.daily_start_time),
         scheduled_response_timeout=args.scheduled_response_timeout,
+        live_open_timeout=args.live_open_timeout,
+        live_connect_attempts=args.live_connect_attempts,
+        live_connect_retry_seconds=args.live_connect_retry_seconds,
+        use_websocket_proxy=(not args.no_websocket_proxy),
     )
     try:
         asyncio.run(main.run())

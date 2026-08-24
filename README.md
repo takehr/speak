@@ -65,6 +65,20 @@ already active at 20:00, the scheduled start is skipped for that day. The app
 must stay running (for example, as the systemd service above) for the schedule
 to fire.
 
+### Gemini Live connection timeouts
+
+Gemini Live WebSocket connections wait up to 30 seconds and retry up to three
+times by default. If regular HTTPS works but Windows repeatedly reports
+`timed out during opening handshake`, try bypassing a stale system proxy:
+
+```bat
+uv run python speak.py --no-websocket-proxy --mode none
+```
+
+The timeout and retry behavior can also be adjusted with
+`--live-open-timeout`, `--live-connect-attempts`, and
+`--live-connect-retry-seconds`.
+
 `--wake-min-confidence` controls how confident Vosk must be before an idle wake
 phrase is accepted. The default is `0.80`; try `0.85` or higher if the app
 starts without you saying the wake word. Wake phrases also require `0.25`
