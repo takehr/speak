@@ -1,4 +1,5 @@
 import contextlib
+import socket
 import unittest
 from unittest import mock
 
@@ -43,6 +44,7 @@ class LiveConnectionRetryTests(unittest.IsolatedAsyncioTestCase):
         loop.live_connect_retry_seconds = 0.0
         loop.live_open_timeout = 30.0
         loop.use_websocket_proxy = True
+        loop.live_force_ipv4 = False
         loop.model = "models/test"
         loop.live_config = {}
         loop._status = lambda *_args, **_kwargs: None
@@ -87,11 +89,16 @@ class LiveClientOptionsTests(unittest.TestCase):
             mock.patch.object(speak, "client_connection_options", None),
             mock.patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}),
         ):
-            client = speak.get_client(live_open_timeout=45.0, use_proxy=False)
+            client = speak.get_client(
+                live_open_timeout=45.0,
+                use_proxy=False,
+                force_ipv4=True,
+            )
 
         websocket_options = client._api_client._websocket_ssl_ctx
         self.assertEqual(websocket_options["open_timeout"], 45.0)
         self.assertIsNone(websocket_options["proxy"])
+        self.assertEqual(websocket_options["family"], socket.AF_INET)
 
 
 if __name__ == "__main__":

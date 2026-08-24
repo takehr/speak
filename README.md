@@ -75,6 +75,13 @@ times by default. If regular HTTPS works but Windows repeatedly reports
 uv run python speak.py --no-websocket-proxy --mode none
 ```
 
+If `Test-NetConnection` reports failed connections to addresses beginning with
+`2001:`, the machine has a broken IPv6 route. Force the Live WebSocket to IPv4:
+
+```bat
+uv run python speak.py --no-websocket-proxy --live-ipv4 --mode none
+```
+
 The timeout and retry behavior can also be adjusted with
 `--live-open-timeout`, `--live-connect-attempts`, and
 `--live-connect-retry-seconds`.

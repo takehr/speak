@@ -19,6 +19,7 @@ import os
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import traceback
@@ -245,9 +246,17 @@ def select_daily_prompt(scenarios, today=None):
     return scenarios[index]
 
 
-def get_client(live_open_timeout=DEFAULT_LIVE_OPEN_TIMEOUT_SECONDS, use_proxy=True):
+def get_client(
+    live_open_timeout=DEFAULT_LIVE_OPEN_TIMEOUT_SECONDS,
+    use_proxy=True,
+    force_ipv4=False,
+):
     global client, client_connection_options
-    connection_options = (float(live_open_timeout), bool(use_proxy))
+    connection_options = (
+        float(live_open_timeout),
+        bool(use_proxy),
+        bool(force_ipv4),
+    )
     if client is None or client_connection_options != connection_options:
         api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
@@ -262,6 +271,12 @@ def get_client(live_open_timeout=DEFAULT_LIVE_OPEN_TIMEOUT_SECONDS, use_proxy=Tr
             },
             api_key=api_key,
         )
+        if force_ipv4:
+            # google-genai filters generic socket options before calling
+            # websockets.connect(), so inject the address family after the
+            # client is built. This keeps broken IPv6 routes from consuming
+            # the entire opening-handshake timeout before IPv4 is attempted.
+            client._api_client._websocket_ssl_ctx["family"] = socket.AF_INET
         client_connection_options = connection_options
     return client
 
@@ -678,6 +693,7 @@ class AudioLoop:
         live_connect_attempts=DEFAULT_LIVE_CONNECT_ATTEMPTS,
         live_connect_retry_seconds=DEFAULT_LIVE_CONNECT_RETRY_SECONDS,
         use_websocket_proxy=True,
+        live_force_ipv4=False,
     ):
         self.video_mode = video_mode
         self.auto_start = auto_start
@@ -701,6 +717,7 @@ class AudioLoop:
         self.live_connect_attempts = live_connect_attempts
         self.live_connect_retry_seconds = live_connect_retry_seconds
         self.use_websocket_proxy = use_websocket_proxy
+        self.live_force_ipv4 = live_force_ipv4
         self.no_auto_start_wake_word = normalize_phrase(no_auto_start_wake_word or "")
         self.prompt_scenarios = load_prompt_scenarios()
         self.daily_prompt = select_daily_prompt(self.prompt_scenarios)
@@ -1600,12 +1617,14 @@ class AudioLoop:
                 "connecting to Gemini Live; "
                 f"attempt={attempt}/{self.live_connect_attempts}; "
                 f"open_timeout={self.live_open_timeout:.0f}s; "
-                f"proxy={'auto' if self.use_websocket_proxy else 'disabled'}"
+                f"proxy={'auto' if self.use_websocket_proxy else 'disabled'}; "
+                f"ip_family={'IPv4' if self.live_force_ipv4 else 'auto'}"
             )
             try:
                 connection = get_client(
                     live_open_timeout=self.live_open_timeout,
                     use_proxy=self.use_websocket_proxy,
+                    force_ipv4=self.live_force_ipv4,
                 ).aio.live.connect(
                     model=self.model,
                     config=self.live_config,
@@ -2106,6 +2125,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Bypass Windows/environment proxy settings for the Gemini Live WebSocket.",
     )
+    parser.add_argument(
+        "--live-ipv4",
+        action="store_true",
+        help="Force Gemini Live WebSocket connections to use IPv4.",
+    )
     search_group = parser.add_mutually_exclusive_group()
     search_group.add_argument(
         "--search",
@@ -2190,6 +2214,7 @@ if __name__ == "__main__":
         live_connect_attempts=args.live_connect_attempts,
         live_connect_retry_seconds=args.live_connect_retry_seconds,
         use_websocket_proxy=(not args.no_websocket_proxy),
+        live_force_ipv4=args.live_ipv4,
     )
     try:
         asyncio.run(main.run())
