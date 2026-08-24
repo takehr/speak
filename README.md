@@ -46,24 +46,33 @@ uv run python speak.py --wake-word "gemini" --mimic-wake-word "copy mode" --exit
 uv run python speak.py --no-auto-start --no-auto-start-wake-word "start talking" --wake-word "gemini" --exit-word "see you" --stt-model-path "./vosk-model-small-en-us-0.15" --mic-index 4 --strict-turns --mode none
 ```
 
-### daily 8 PM conversation
+### hourly afternoon conversations
 
 While the app is running, it automatically starts the normal daily-prompt
-conversation at `20:00` in the computer's local time. After Gemini finishes its
-first message, the app waits up to 60 seconds for microphone activity. If nobody
-responds, it returns to idle wake-word mode automatically.
+conversation every hour at `13:00`, `14:00`, `15:00`, `16:00`, `17:00`,
+`18:00`, `19:00`, and `20:00` in the computer's local time. After Gemini
+finishes its first message, the app waits up to 60 seconds for sustained
+microphone activity. If nobody responds, it returns to idle wake-word mode
+automatically.
+
+Once a normal-mode session has a real user response and remains active for at
+least 60 seconds, practice is complete for that date and all remaining
+automatic starts are skipped. The completion date is saved in
+`state/daily_practice_date.txt`, so an application restart does not reset it.
 
 ```bash
 uv run python speak.py \
-  --daily-start-time 20:00 \
   --scheduled-response-timeout 60 \
+  --daily-practice-min-seconds 60 \
   --mode none
 ```
 
-Use `--no-daily-start` to disable the schedule. If another conversation is
-already active at 20:00, the scheduled start is skipped for that day. The app
-must stay running (for example, as the systemd service above) for the schedule
-to fire.
+Use `--no-daily-start` to disable the schedule. `--daily-start-time HH:MM` adds
+an extra time to the default schedule. A legacy `--daily-start-time 20:00` in
+an existing startup command is harmless because 20:00 is already included. If
+another conversation is active at a scheduled time, that start is skipped. The
+app must stay running (for example, as the systemd service above) for the
+schedule to fire.
 
 ### Gemini Live connection timeouts
 

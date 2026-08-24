@@ -58,8 +58,9 @@ VOICE_COMMAND_ECHO_GRACE_SECONDS = 2.0
 WAKE_COMMAND_MIN_CONFIDENCE = 0.80
 WAKE_COMMAND_MIN_RMS = 45.0
 WAKE_COMMAND_MIN_ACTIVE_SECONDS = 0.25
-DEFAULT_DAILY_START_TIME = dt.time(hour=20, minute=0)
+DEFAULT_DAILY_START_TIMES = tuple(dt.time(hour=hour) for hour in range(13, 21))
 DEFAULT_SCHEDULED_RESPONSE_TIMEOUT_SECONDS = 60.0
+DEFAULT_DAILY_PRACTICE_MIN_SECONDS = 60.0
 DAILY_START_CATCH_UP_SECONDS = 60.0
 MICROPHONE_RETRY_SECONDS = 2.0
 AUDIO_STREAM_CLOSE_TIMEOUT_SECONDS = 2.0
@@ -80,7 +81,9 @@ DEFAULT_TRANSLATE_WAKE_WORD = "translate"
 DEFAULT_EXIT_WORD = "see you"
 DEFAULT_STT_MODEL_PATH = "./models/vosk-model-small-en-us-0.15"
 LOG_DIR = Path("./logs")
+STATE_DIR = Path("./state")
 PROMPTS_DIR = Path("./prompts")
+DAILY_PRACTICE_STATE_PATH = STATE_DIR / "daily_practice_date.txt"
 IDLE_SOUND_PATH = Path("./VSQSE_0522_pirorin_01.mp3")
 IDLE_SOUND_HELPER_PATH = Path("./play_idle_sound.py")
 
@@ -184,6 +187,28 @@ def next_daily_occurrence(now, scheduled_time):
     if now <= candidate + catch_up_window:
         return candidate
     return candidate + dt.timedelta(days=1)
+
+
+def next_scheduled_occurrence(now, scheduled_times):
+    if not scheduled_times:
+        raise ValueError("at least one scheduled time is required")
+    return min(next_daily_occurrence(now, item) for item in scheduled_times)
+
+
+def load_daily_practice_date(path=DAILY_PRACTICE_STATE_PATH):
+    try:
+        value = Path(path).read_text(encoding="utf-8").strip()
+        return dt.date.fromisoformat(value)
+    except (OSError, ValueError):
+        return None
+
+
+def save_daily_practice_date(completed_date, path=DAILY_PRACTICE_STATE_PATH):
+    resolved = Path(path)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    temporary = resolved.with_suffix(resolved.suffix + ".tmp")
+    temporary.write_text(completed_date.isoformat(), encoding="utf-8")
+    temporary.replace(resolved)
 
 
 def phrase_in_text(phrase, text):
@@ -687,8 +712,11 @@ class AudioLoop:
         wake_min_confidence=WAKE_COMMAND_MIN_CONFIDENCE,
         wake_min_rms=WAKE_COMMAND_MIN_RMS,
         wake_min_active_seconds=WAKE_COMMAND_MIN_ACTIVE_SECONDS,
-        daily_start_time=DEFAULT_DAILY_START_TIME,
+        daily_start_time=None,
+        daily_start_times=DEFAULT_DAILY_START_TIMES,
         scheduled_response_timeout=DEFAULT_SCHEDULED_RESPONSE_TIMEOUT_SECONDS,
+        daily_practice_min_seconds=DEFAULT_DAILY_PRACTICE_MIN_SECONDS,
+        daily_practice_state_path=DAILY_PRACTICE_STATE_PATH,
         live_open_timeout=DEFAULT_LIVE_OPEN_TIMEOUT_SECONDS,
         live_connect_attempts=DEFAULT_LIVE_CONNECT_ATTEMPTS,
         live_connect_retry_seconds=DEFAULT_LIVE_CONNECT_RETRY_SECONDS,
@@ -711,8 +739,13 @@ class AudioLoop:
         self.wake_min_confidence = wake_min_confidence
         self.wake_min_rms = wake_min_rms
         self.wake_min_active_seconds = wake_min_active_seconds
-        self.daily_start_time = daily_start_time
+        if daily_start_time is not None:
+            self.daily_start_times = (daily_start_time,)
+        else:
+            self.daily_start_times = tuple(sorted(set(daily_start_times or ())))
         self.scheduled_response_timeout = scheduled_response_timeout
+        self.daily_practice_min_seconds = daily_practice_min_seconds
+        self.daily_practice_state_path = Path(daily_practice_state_path)
         self.live_open_timeout = live_open_timeout
         self.live_connect_attempts = live_connect_attempts
         self.live_connect_retry_seconds = live_connect_retry_seconds
@@ -724,6 +757,9 @@ class AudioLoop:
         self.live_config = build_live_config(enable_search=self.enable_search)
 
         self.logger = configure_logging()
+        self._daily_practice_completed_date = load_daily_practice_date(
+            self.daily_practice_state_path
+        )
         self.speaker = LocalSpeaker(self.logger)
         self.sound_player = LocalSoundPlayer(self.logger)
         self.detector = LocalCommandDetector(
@@ -766,6 +802,9 @@ class AudioLoop:
         self._session_failure = None
         self._scheduled_first_turn_complete_event = None
         self._scheduled_user_response_event = None
+        self._session_mode = None
+        self._session_active_started_at = 0.0
+        self._session_user_responded = False
         self._stdin_reader = None
         self._stdin_read_transport = None
         self.local_output_active = False
@@ -785,6 +824,49 @@ class AudioLoop:
     def _status(self, text, level="info"):
         getattr(self.logger, level)("%s", text)
         print(f"[status] {text}")
+
+    def _daily_practice_completed_today(self, today=None):
+        current_date = today or dt.date.today()
+        return self._daily_practice_completed_date == current_date
+
+    def _mark_daily_practice_complete(self, completed_date=None):
+        completed_date = completed_date or dt.date.today()
+        if self._daily_practice_completed_date == completed_date:
+            return
+        self._daily_practice_completed_date = completed_date
+        try:
+            save_daily_practice_date(
+                completed_date,
+                path=self.daily_practice_state_path,
+            )
+        except OSError as exc:
+            self._status(
+                f"could not persist daily practice completion: {exc}",
+                level="warning",
+            )
+        self._status(
+            "daily normal-mode practice completed; "
+            "remaining automatic starts are disabled for today"
+        )
+
+    def _mark_session_user_response(self, source):
+        if self._session_user_responded:
+            return
+        self._session_user_responded = True
+        self._status(f"user response confirmed; source={source}")
+
+    def _maybe_mark_daily_practice_complete(self):
+        if (
+            self._session_mode != "prompt"
+            or not self._session_user_responded
+            or self._session_active_started_at <= 0.0
+        ):
+            return False
+        active_seconds = self._loop_time() - self._session_active_started_at
+        if active_seconds < self.daily_practice_min_seconds:
+            return False
+        self._mark_daily_practice_complete()
+        return True
 
     def _suppress_voice_commands(self, seconds, reason):
         until = self._loop_time() + seconds
@@ -1245,6 +1327,12 @@ class AudioLoop:
                     and not self._scheduled_first_turn_complete_event.is_set()
                 ):
                     self._scheduled_first_turn_complete_event.set()
+                    if (
+                        self._session_user_responded
+                        and self._scheduled_user_response_event is not None
+                        and not self._scheduled_user_response_event.is_set()
+                    ):
+                        self._scheduled_user_response_event.set()
 
                 self.assistant_audio_streaming = False
                 if not self.strict_turns and self.audio_in_queue is not None:
@@ -1392,14 +1480,17 @@ class AudioLoop:
                     self.user_activity_active
                     and now - self._user_activity_started_at
                     >= self.wake_min_active_seconds
-                    and self._scheduled_first_turn_complete_event is not None
-                    and self._scheduled_first_turn_complete_event.is_set()
-                    and self._scheduled_user_response_event is not None
-                    and not self._scheduled_user_response_event.is_set()
                     and not self.assistant_speaking
                 ):
-                    self._scheduled_user_response_event.set()
-                    self._status("user response detected for scheduled session")
+                    self._mark_session_user_response("voice")
+                    if (
+                        self._scheduled_first_turn_complete_event is not None
+                        and self._scheduled_first_turn_complete_event.is_set()
+                        and self._scheduled_user_response_event is not None
+                        and not self._scheduled_user_response_event.is_set()
+                    ):
+                        self._scheduled_user_response_event.set()
+                        self._status("user response detected for scheduled session")
 
                 if (
                     self.user_activity_active
@@ -1499,9 +1590,20 @@ class AudioLoop:
 
         await stop_event.wait()
 
+    async def monitor_daily_practice_completion(self):
+        stop_event = self.session_stop_event
+        if stop_event is None:
+            return
+
+        while self.running and self.state == "active":
+            if self._maybe_mark_daily_practice_complete():
+                await stop_event.wait()
+                return
+            await asyncio.sleep(0.5)
+
     async def schedule_daily_session(self):
         now = dt.datetime.now().astimezone()
-        next_run = next_daily_occurrence(now, self.daily_start_time)
+        next_run = next_scheduled_occurrence(now, self.daily_start_times)
         self._status(
             "daily normal session scheduled for "
             f"{next_run.isoformat(timespec='minutes')}"
@@ -1515,8 +1617,17 @@ class AudioLoop:
                 continue
 
             scheduled_for = next_run
-            next_run = scheduled_for + dt.timedelta(days=1)
-            if self.state == "idle":
+            next_run = next_scheduled_occurrence(
+                scheduled_for
+                + dt.timedelta(seconds=DAILY_START_CATCH_UP_SECONDS + 1),
+                self.daily_start_times,
+            )
+            if self._daily_practice_completed_today(scheduled_for.date()):
+                self._status(
+                    "daily start time reached, but today's practice is already "
+                    "complete; skipping automatic start"
+                )
+            elif self.state == "idle":
                 self._status(
                     "daily start time reached; starting normal conversation"
                 )
@@ -1576,6 +1687,7 @@ class AudioLoop:
             if self.session is not None and self.state == "active":
                 while self.strict_turns and self.assistant_speaking:
                     await asyncio.sleep(0.05)
+                self._mark_session_user_response("text")
                 if (
                     self._scheduled_user_response_event is not None
                     and not self._scheduled_user_response_event.is_set()
@@ -1713,6 +1825,8 @@ class AudioLoop:
                 else:
                     self.logger.exception("session task cleanup failure: %s", exc)
 
+        self._maybe_mark_daily_practice_complete()
+
         self.assistant_speaking = False
         self.assistant_audio_streaming = False
         self.user_activity_active = False
@@ -1726,6 +1840,9 @@ class AudioLoop:
         self.session_task = None
         self._scheduled_first_turn_complete_event = None
         self._scheduled_user_response_event = None
+        self._session_mode = None
+        self._session_active_started_at = 0.0
+        self._session_user_responded = False
         self._set_state("idle")
         if self.running and not self.shutdown_requested:
             self._status(
@@ -1733,6 +1850,9 @@ class AudioLoop:
             )
 
     async def _run_session(self, session_mode, require_scheduled_response=False):
+        self._session_mode = session_mode
+        self._session_active_started_at = 0.0
+        self._session_user_responded = False
         self._set_state("connecting")
         if require_scheduled_response:
             self._scheduled_first_turn_complete_event = asyncio.Event()
@@ -1757,6 +1877,7 @@ class AudioLoop:
                 self.out_queue = asyncio.Queue(maxsize=5)
                 self._clear_out_queue_pressure()
                 self._set_state("active")
+                self._session_active_started_at = self._loop_time()
 
                 self._start_session_task(session_tasks, self.send_realtime(), "send_realtime")
                 self._start_session_task(session_tasks, self.receive_audio(), "receive_audio")
@@ -1764,6 +1885,12 @@ class AudioLoop:
                 self._start_session_task(
                     session_tasks, self.monitor_session_health(), "monitor_session_health"
                 )
+                if session_mode == "prompt":
+                    self._start_session_task(
+                        session_tasks,
+                        self.monitor_daily_practice_completion(),
+                        "monitor_daily_practice_completion",
+                    )
                 if require_scheduled_response:
                     self._start_session_task(
                         session_tasks,
@@ -1844,6 +1971,9 @@ class AudioLoop:
         self._session_failure = None
         self._scheduled_first_turn_complete_event = None
         self._scheduled_user_response_event = None
+        self._session_mode = None
+        self._session_active_started_at = 0.0
+        self._session_user_responded = False
         self.local_output_active = False
         self.detector.reset()
 
@@ -1873,7 +2003,7 @@ class AudioLoop:
             self._start_background_task(background_tasks, self.listen_microphone(), "listen_microphone")
             if self.enable_text_input:
                 self._start_background_task(background_tasks, self.send_text(), "send_text")
-            if self.daily_start_time is not None:
+            if self.daily_start_times:
                 self._start_background_task(
                     background_tasks,
                     self.schedule_daily_session(),
@@ -2065,11 +2195,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--daily-start-time",
         type=parse_clock_time,
-        default=DEFAULT_DAILY_START_TIME,
+        action="append",
+        default=None,
         metavar="HH:MM",
         help=(
-            "Local time to automatically start a normal conversation each day. "
-            "Defaults to 20:00."
+            "Add another local time for automatic normal conversation start. "
+            "The default schedule runs every hour from 13:00 through 20:00."
         ),
     )
     parser.add_argument(
@@ -2085,6 +2216,16 @@ if __name__ == "__main__":
         help=(
             "Return a scheduled session to idle if the user does not respond "
             "within this many seconds. Defaults to 60."
+        ),
+    )
+    parser.add_argument(
+        "--daily-practice-min-seconds",
+        type=float,
+        default=DEFAULT_DAILY_PRACTICE_MIN_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "Normal-mode conversation duration that completes today's practice "
+            "after a user response. Defaults to 60 seconds."
         ),
     )
     parser.add_argument(
@@ -2170,6 +2311,8 @@ if __name__ == "__main__":
         parser.error("--wake-min-active-seconds must be non-negative.")
     if args.scheduled_response_timeout <= 0.0:
         parser.error("--scheduled-response-timeout must be positive.")
+    if args.daily_practice_min_seconds <= 0.0:
+        parser.error("--daily-practice-min-seconds must be positive.")
     if args.live_open_timeout <= 0.0:
         parser.error("--live-open-timeout must be positive.")
     if args.live_connect_attempts < 1:
@@ -2208,8 +2351,18 @@ if __name__ == "__main__":
         wake_min_confidence=args.wake_min_confidence,
         wake_min_rms=args.wake_min_rms,
         wake_min_active_seconds=args.wake_min_active_seconds,
-        daily_start_time=(None if args.no_daily_start else args.daily_start_time),
+        daily_start_times=(
+            ()
+            if args.no_daily_start
+            else tuple(
+                sorted(
+                    set(DEFAULT_DAILY_START_TIMES)
+                    | set(args.daily_start_time or ())
+                )
+            )
+        ),
         scheduled_response_timeout=args.scheduled_response_timeout,
+        daily_practice_min_seconds=args.daily_practice_min_seconds,
         live_open_timeout=args.live_open_timeout,
         live_connect_attempts=args.live_connect_attempts,
         live_connect_retry_seconds=args.live_connect_retry_seconds,
