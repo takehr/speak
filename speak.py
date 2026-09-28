@@ -131,10 +131,29 @@ client = None
 client_connection_options = None
 
 
-def build_live_config(enable_search=False):
+def build_live_config(enable_search=False, automatic_vad=True):
     tools = None
     if enable_search:
         tools = [{"google_search": {}}]
+
+    if automatic_vad:
+        realtime_input_config = types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                disabled=False,
+                start_of_speech_sensitivity="START_SENSITIVITY_LOW",
+                end_of_speech_sensitivity="END_SENSITIVITY_HIGH",
+                prefix_padding_ms=300,
+                silence_duration_ms=800,
+            ),
+            turn_coverage="TURN_INCLUDES_ONLY_ACTIVITY",
+        )
+    else:
+        realtime_input_config = types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                disabled=True
+            ),
+            turn_coverage="TURN_INCLUDES_ALL_INPUT",
+        )
 
     return types.LiveConnectConfig(
         response_modalities=["AUDIO"],
@@ -144,12 +163,7 @@ def build_live_config(enable_search=False):
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
             )
         ),
-        realtime_input_config=types.RealtimeInputConfig(
-            automatic_activity_detection=types.AutomaticActivityDetection(
-                disabled=True
-            ),
-            turn_coverage="TURN_INCLUDES_ALL_INPUT",
-        ),
+        realtime_input_config=realtime_input_config,
         context_window_compression=types.ContextWindowCompressionConfig(
             trigger_tokens=25600,
             sliding_window=types.SlidingWindow(target_tokens=12800),
@@ -709,6 +723,7 @@ class AudioLoop:
         vad_start_rms=USER_SPEECH_START_RMS,
         vad_end_rms=USER_SPEECH_END_RMS,
         vad_silence_seconds=USER_SPEECH_SILENCE_SECONDS,
+        automatic_vad=True,
         wake_min_confidence=WAKE_COMMAND_MIN_CONFIDENCE,
         wake_min_rms=WAKE_COMMAND_MIN_RMS,
         wake_min_active_seconds=WAKE_COMMAND_MIN_ACTIVE_SECONDS,
@@ -736,6 +751,7 @@ class AudioLoop:
         self.vad_start_rms = vad_start_rms
         self.vad_end_rms = vad_end_rms
         self.vad_silence_seconds = vad_silence_seconds
+        self.automatic_vad = automatic_vad
         self.wake_min_confidence = wake_min_confidence
         self.wake_min_rms = wake_min_rms
         self.wake_min_active_seconds = wake_min_active_seconds
@@ -754,7 +770,10 @@ class AudioLoop:
         self.no_auto_start_wake_word = normalize_phrase(no_auto_start_wake_word or "")
         self.prompt_scenarios = load_prompt_scenarios()
         self.daily_prompt = select_daily_prompt(self.prompt_scenarios)
-        self.live_config = build_live_config(enable_search=self.enable_search)
+        self.live_config = build_live_config(
+            enable_search=self.enable_search,
+            automatic_vad=self.automatic_vad,
+        )
 
         self.logger = configure_logging()
         self._daily_practice_completed_date = load_daily_practice_date(
@@ -1471,8 +1490,14 @@ class AudioLoop:
                     self.user_activity_active = True
                     self._user_activity_started_at = now
                     self._last_user_voice_at = now
-                    self._status(f"user speech started; rms={rms:.0f}")
-                    await self._enqueue_realtime_message({"kind": "activity_start"})
+                    if self.automatic_vad:
+                        self._status(
+                            f"user speech level detected; rms={rms:.0f}; "
+                            "Gemini automatic VAD controls turn boundaries"
+                        )
+                    else:
+                        self._status(f"user speech started; rms={rms:.0f}")
+                        await self._enqueue_realtime_message({"kind": "activity_start"})
                 elif self.user_activity_active and rms >= self.vad_end_rms:
                     self._last_user_voice_at = now
 
@@ -1500,10 +1525,17 @@ class AudioLoop:
                     duration = now - self._user_activity_started_at
                     self.user_activity_active = False
                     self._user_activity_started_at = 0.0
-                    self._status(
-                        f"user speech ended; duration={duration:.1f}s; sending activity_end"
-                    )
-                    await self._enqueue_realtime_message({"kind": "activity_end"})
+                    if self.automatic_vad:
+                        self._status(
+                            f"local speech level ended; duration={duration:.1f}s; "
+                            "Gemini automatic VAD remains authoritative"
+                        )
+                    else:
+                        self._status(
+                            f"user speech ended; duration={duration:.1f}s; "
+                            "sending activity_end"
+                        )
+                        await self._enqueue_realtime_message({"kind": "activity_end"})
 
                 await self._enqueue_realtime_message(
                     {
@@ -1864,6 +1896,7 @@ class AudioLoop:
             f"session_mode={session_mode}; "
             f"send_opening_prompt={opening_prompt is not None}; "
             f"search_enabled={self.enable_search}; "
+            f"vad={'Gemini-auto' if self.automatic_vad else 'local-manual'}; "
             f"open_timeout={self.live_open_timeout:.0f}s"
         )
         self.session_stop_event = asyncio.Event()
@@ -2282,17 +2315,31 @@ if __name__ == "__main__":
         action="store_true",
         help="Explicitly disable Google Search grounding for Live sessions.",
     )
+    vad_mode_group = parser.add_mutually_exclusive_group()
+    vad_mode_group.add_argument(
+        "--auto-vad",
+        dest="automatic_vad",
+        action="store_true",
+        default=True,
+        help="Let Gemini automatically detect speech start and end (default).",
+    )
+    vad_mode_group.add_argument(
+        "--manual-vad",
+        dest="automatic_vad",
+        action="store_false",
+        help="Use local RMS thresholds and send explicit activity signals.",
+    )
     parser.add_argument(
         "--vad-start-rms",
         type=float,
         default=USER_SPEECH_START_RMS,
-        help="RMS level that starts a user speech activity.",
+        help="RMS level that starts local speech tracking/manual VAD.",
     )
     parser.add_argument(
         "--vad-end-rms",
         type=float,
         default=USER_SPEECH_END_RMS,
-        help="RMS level below which silence can end a user speech activity.",
+        help="RMS level below which local speech tracking/manual VAD can end.",
     )
     parser.add_argument(
         "--vad-silence-seconds",
@@ -2348,6 +2395,7 @@ if __name__ == "__main__":
         vad_start_rms=args.vad_start_rms,
         vad_end_rms=args.vad_end_rms,
         vad_silence_seconds=args.vad_silence_seconds,
+        automatic_vad=args.automatic_vad,
         wake_min_confidence=args.wake_min_confidence,
         wake_min_rms=args.wake_min_rms,
         wake_min_active_seconds=args.wake_min_active_seconds,
