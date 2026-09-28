@@ -127,10 +127,11 @@ The full markdown content is sent as the opening prompt when auto-start is enabl
 When you start with `--no-auto-start`, Gemini connects without sending the first turn.
 In this mode, the Live session also enables the Google Search tool. Pass
 `--no-search` only when you want a plain voice session.
-By default, Gemini Live automatically detects speech start and end. This avoids
-having to tune RMS thresholds for each microphone or room and is more tolerant
-of intermittent noises such as keyboard sounds. The startup log shows
-`vad=Gemini-auto` when this is active.
+By default, Gemini Live detects speech automatically, with a local WebRTC VAD
+as a fallback for speech end. If server-side detection gets stuck on persistent
+room or keyboard noise, the client sends `audio_stream_end` after a detected
+speech pause. No microphone-specific RMS tuning is required. The startup log
+shows `vad=Gemini-auto+client-end` when this hybrid mode is active.
 
 For troubleshooting, `--manual-vad` switches back to local RMS-based activity
 signals. In that mode, `--vad-start-rms`, `--vad-end-rms`, and

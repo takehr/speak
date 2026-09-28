@@ -4,7 +4,7 @@ Quickstart:
 https://github.com/google-gemini/cookbook/blob/main/quickstarts/Get_started_LiveAPI.py
 
 ## Setup
-pip install google-genai opencv-python pyaudio pillow mss vosk pyttsx3
+pip install google-genai opencv-python pyaudio pillow mss vosk pyttsx3 webrtcvad-wheels
 """
 
 import argparse
@@ -23,11 +23,13 @@ import socket
 import subprocess
 import sys
 import traceback
+from collections import deque
 from pathlib import Path
 
 import cv2
 import pyaudio
 import PIL.Image
+import webrtcvad
 
 from google import genai
 from google.genai import errors
@@ -54,6 +56,13 @@ HEALTH_CHECK_INTERVAL_SECONDS = 1.0
 USER_SPEECH_START_RMS = 45.0
 USER_SPEECH_END_RMS = 25.0
 USER_SPEECH_SILENCE_SECONDS = 0.8
+HYBRID_VAD_FRAME_MS = 20
+HYBRID_VAD_START_SECONDS = 0.24
+HYBRID_VAD_END_SECONDS = 0.8
+HYBRID_VAD_MAX_TURN_SECONDS = 30.0
+HYBRID_VAD_START_SPEECH_RATIO = 0.60
+HYBRID_VAD_END_SPEECH_RATIO = 0.20
+HYBRID_VAD_RESPONSE_WAIT_SECONDS = 10.0
 VOICE_COMMAND_ECHO_GRACE_SECONDS = 2.0
 WAKE_COMMAND_MIN_CONFIDENCE = 0.80
 WAKE_COMMAND_MIN_RMS = 45.0
@@ -703,6 +712,87 @@ class LocalCommandDetector:
         return None
 
 
+class HybridTurnDetector:
+    """Language-independent client VAD used to close stalled server-VAD turns."""
+
+    def __init__(
+        self,
+        sample_rate=SEND_SAMPLE_RATE,
+        frame_ms=HYBRID_VAD_FRAME_MS,
+        start_seconds=HYBRID_VAD_START_SECONDS,
+        end_seconds=HYBRID_VAD_END_SECONDS,
+        max_turn_seconds=HYBRID_VAD_MAX_TURN_SECONDS,
+        start_speech_ratio=HYBRID_VAD_START_SPEECH_RATIO,
+        end_speech_ratio=HYBRID_VAD_END_SPEECH_RATIO,
+        aggressiveness=2,
+        vad=None,
+    ):
+        self.sample_rate = sample_rate
+        self.frame_ms = frame_ms
+        self.frame_bytes = sample_rate * frame_ms // 1000 * 2
+        self.start_window_frames = max(1, round(start_seconds * 1000 / frame_ms))
+        self.end_window_frames = max(1, round(end_seconds * 1000 / frame_ms))
+        self.max_turn_frames = max(1, round(max_turn_seconds * 1000 / frame_ms))
+        self.start_speech_ratio = start_speech_ratio
+        self.end_speech_ratio = end_speech_ratio
+        self.vad = vad or webrtcvad.Vad(aggressiveness)
+        self._pcm_buffer = bytearray()
+        self._start_window = deque(maxlen=self.start_window_frames)
+        self._end_window = deque(maxlen=self.end_window_frames)
+        self.speech_active = False
+        self._turn_frames = 0
+
+    def reset(self):
+        self._pcm_buffer.clear()
+        self._start_window.clear()
+        self._end_window.clear()
+        self.speech_active = False
+        self._turn_frames = 0
+
+    def feed(self, pcm_bytes):
+        """Return (speech_started, speech_ended, forced_end)."""
+        self._pcm_buffer.extend(pcm_bytes)
+        speech_started = False
+        speech_ended = False
+        forced_end = False
+
+        while len(self._pcm_buffer) >= self.frame_bytes:
+            frame = bytes(self._pcm_buffer[: self.frame_bytes])
+            del self._pcm_buffer[: self.frame_bytes]
+            is_speech = bool(self.vad.is_speech(frame, self.sample_rate))
+
+            if not self.speech_active:
+                self._start_window.append(is_speech)
+                if (
+                    len(self._start_window) == self.start_window_frames
+                    and sum(self._start_window) / len(self._start_window)
+                    >= self.start_speech_ratio
+                ):
+                    self.speech_active = True
+                    self._turn_frames = 0
+                    self._end_window.clear()
+                    speech_started = True
+                continue
+
+            self._turn_frames += 1
+            self._end_window.append(is_speech)
+            reached_maximum = self._turn_frames >= self.max_turn_frames
+            likely_silence = (
+                len(self._end_window) == self.end_window_frames
+                and sum(self._end_window) / len(self._end_window)
+                <= self.end_speech_ratio
+            )
+            if not (likely_silence or reached_maximum):
+                continue
+
+            speech_ended = True
+            forced_end = reached_maximum and not likely_silence
+            self.reset()
+            break
+
+        return speech_started, speech_ended, forced_end
+
+
 class AudioLoop:
     def __init__(
         self,
@@ -793,6 +883,9 @@ class AudioLoop:
             wake_min_rms=self.wake_min_rms,
             wake_min_active_seconds=self.wake_min_active_seconds,
         )
+        self.hybrid_turn_detector = (
+            HybridTurnDetector() if self.automatic_vad else None
+        )
 
         self.audio_stream = None
         self.session = None
@@ -824,6 +917,8 @@ class AudioLoop:
         self._session_mode = None
         self._session_active_started_at = 0.0
         self._session_user_responded = False
+        self._awaiting_model_response = False
+        self._audio_stream_end_sent_at = 0.0
         self._stdin_reader = None
         self._stdin_read_transport = None
         self.local_output_active = False
@@ -1289,6 +1384,11 @@ class AudioLoop:
                             ),
                             timeout=REALTIME_SEND_TIMEOUT_SECONDS,
                         )
+                    elif msg.get("kind") == "audio_stream_end":
+                        await asyncio.wait_for(
+                            self.session.send_realtime_input(audio_stream_end=True),
+                            timeout=REALTIME_SEND_TIMEOUT_SECONDS,
+                        )
                     elif msg.get("kind") == "video":
                         await asyncio.wait_for(
                             self.session.send_realtime_input(
@@ -1327,6 +1427,12 @@ class AudioLoop:
 
                 turn = self.session.receive()
                 async for response in turn:
+                    server_content = getattr(response, "server_content", None)
+                    if server_content and server_content.model_turn:
+                        self._awaiting_model_response = False
+                        self._audio_stream_end_sent_at = 0.0
+                        if self.hybrid_turn_detector is not None:
+                            self.hybrid_turn_detector.reset()
                     if self._debug_every("_last_receive_chunk_log", 2.0):
                         self._status("received Gemini response chunk")
                     for part in iter_response_parts(response):
@@ -1340,6 +1446,10 @@ class AudioLoop:
                             print(part.text, end="")
 
                 self._status("Gemini turn complete")
+                self._awaiting_model_response = False
+                self._audio_stream_end_sent_at = 0.0
+                if self.hybrid_turn_detector is not None:
+                    self.hybrid_turn_detector.reset()
 
                 if (
                     self._scheduled_first_turn_complete_event is not None
@@ -1486,18 +1596,72 @@ class AudioLoop:
             )
             if can_stream_audio:
                 now = self._loop_time()
+                if self.automatic_vad:
+                    if self._awaiting_model_response:
+                        wait_seconds = now - self._audio_stream_end_sent_at
+                        if wait_seconds < HYBRID_VAD_RESPONSE_WAIT_SECONDS:
+                            continue
+                        self._status(
+                            "no Gemini response after local audio stream end; "
+                            "reopening microphone stream",
+                            level="warning",
+                        )
+                        self._awaiting_model_response = False
+                        self._audio_stream_end_sent_at = 0.0
+                        self.hybrid_turn_detector.reset()
+
+                    speech_started, speech_ended, forced_end = (
+                        self.hybrid_turn_detector.feed(data)
+                    )
+                    if speech_started:
+                        self.user_activity_active = True
+                        self._user_activity_started_at = now
+                        self._status(
+                            "client speech detector started; "
+                            "Gemini automatic VAD remains primary"
+                        )
+                        self._mark_session_user_response("voice")
+                        if (
+                            self._scheduled_first_turn_complete_event is not None
+                            and self._scheduled_first_turn_complete_event.is_set()
+                            and self._scheduled_user_response_event is not None
+                            and not self._scheduled_user_response_event.is_set()
+                        ):
+                            self._scheduled_user_response_event.set()
+                            self._status(
+                                "user response detected for scheduled session"
+                            )
+
+                    await self._enqueue_realtime_message(
+                        {
+                            "kind": "audio",
+                            "data": data,
+                            "mime_type": f"audio/pcm;rate={SEND_SAMPLE_RATE}",
+                        }
+                    )
+
+                    if speech_ended:
+                        duration = max(0.0, now - self._user_activity_started_at)
+                        reason = "maximum turn length" if forced_end else "speech pause"
+                        self.user_activity_active = False
+                        self._user_activity_started_at = 0.0
+                        self._status(
+                            f"client speech detector ended; duration={duration:.1f}s; "
+                            f"reason={reason}; sending audio_stream_end"
+                        )
+                        if await self._enqueue_realtime_message(
+                            {"kind": "audio_stream_end"}
+                        ):
+                            self._awaiting_model_response = True
+                            self._audio_stream_end_sent_at = now
+                    continue
+
                 if not self.user_activity_active and rms >= self.vad_start_rms:
                     self.user_activity_active = True
                     self._user_activity_started_at = now
                     self._last_user_voice_at = now
-                    if self.automatic_vad:
-                        self._status(
-                            f"user speech level detected; rms={rms:.0f}; "
-                            "Gemini automatic VAD controls turn boundaries"
-                        )
-                    else:
-                        self._status(f"user speech started; rms={rms:.0f}")
-                        await self._enqueue_realtime_message({"kind": "activity_start"})
+                    self._status(f"user speech started; rms={rms:.0f}")
+                    await self._enqueue_realtime_message({"kind": "activity_start"})
                 elif self.user_activity_active and rms >= self.vad_end_rms:
                     self._last_user_voice_at = now
 
@@ -1525,17 +1689,11 @@ class AudioLoop:
                     duration = now - self._user_activity_started_at
                     self.user_activity_active = False
                     self._user_activity_started_at = 0.0
-                    if self.automatic_vad:
-                        self._status(
-                            f"local speech level ended; duration={duration:.1f}s; "
-                            "Gemini automatic VAD remains authoritative"
-                        )
-                    else:
-                        self._status(
-                            f"user speech ended; duration={duration:.1f}s; "
-                            "sending activity_end"
-                        )
-                        await self._enqueue_realtime_message({"kind": "activity_end"})
+                    self._status(
+                        f"user speech ended; duration={duration:.1f}s; "
+                        "sending activity_end"
+                    )
+                    await self._enqueue_realtime_message({"kind": "activity_end"})
 
                 await self._enqueue_realtime_message(
                     {
@@ -1549,6 +1707,8 @@ class AudioLoop:
             if self.user_activity_active:
                 self.user_activity_active = False
                 self._user_activity_started_at = 0.0
+            if self.hybrid_turn_detector is not None and self.assistant_speaking:
+                self.hybrid_turn_detector.reset()
 
             if (
                 self.state == "active"
@@ -1863,6 +2023,10 @@ class AudioLoop:
         self.assistant_audio_streaming = False
         self.user_activity_active = False
         self._user_activity_started_at = 0.0
+        self._awaiting_model_response = False
+        self._audio_stream_end_sent_at = 0.0
+        if self.hybrid_turn_detector is not None:
+            self.hybrid_turn_detector.reset()
         self.audio_in_queue = None
         self.out_queue = None
         self._clear_out_queue_pressure()
@@ -1885,6 +2049,10 @@ class AudioLoop:
         self._session_mode = session_mode
         self._session_active_started_at = 0.0
         self._session_user_responded = False
+        self._awaiting_model_response = False
+        self._audio_stream_end_sent_at = 0.0
+        if self.hybrid_turn_detector is not None:
+            self.hybrid_turn_detector.reset()
         self._set_state("connecting")
         if require_scheduled_response:
             self._scheduled_first_turn_complete_event = asyncio.Event()
@@ -1896,7 +2064,7 @@ class AudioLoop:
             f"session_mode={session_mode}; "
             f"send_opening_prompt={opening_prompt is not None}; "
             f"search_enabled={self.enable_search}; "
-            f"vad={'Gemini-auto' if self.automatic_vad else 'local-manual'}; "
+            f"vad={'Gemini-auto+client-end' if self.automatic_vad else 'local-manual'}; "
             f"open_timeout={self.live_open_timeout:.0f}s"
         )
         self.session_stop_event = asyncio.Event()
@@ -2000,6 +2168,10 @@ class AudioLoop:
         self.user_activity_active = False
         self._user_activity_started_at = 0.0
         self._last_user_voice_at = 0.0
+        self._awaiting_model_response = False
+        self._audio_stream_end_sent_at = 0.0
+        if self.hybrid_turn_detector is not None:
+            self.hybrid_turn_detector.reset()
         self._clear_out_queue_pressure()
         self._session_failure = None
         self._scheduled_first_turn_complete_event = None

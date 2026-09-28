@@ -12,4 +12,5 @@ dependencies = [
     "pygame>=2.6.1",
     "pyaudio>=0.2.14",
     "pyttsx3>=2.99",
+    "webrtcvad-wheels>=2.0.14",
 ]
