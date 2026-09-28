@@ -31,36 +31,45 @@ class HybridTurnDetectorTests(unittest.TestCase):
         decisions = [True, False, False, True, False, False]
         detector = self.make_detector(decisions)
 
-        started, ended, forced = detector.feed(self.frames(detector, len(decisions)))
+        started, ended, forced, audio = detector.feed(
+            self.frames(detector, len(decisions))
+        )
 
         self.assertFalse(started)
         self.assertFalse(ended)
         self.assertFalse(forced)
+        self.assertFalse(audio)
 
     def test_closes_turn_after_detected_speech_and_pause(self):
         decisions = [True, True, False, False, False, False, False]
         detector = self.make_detector(decisions)
 
-        started, ended, forced = detector.feed(self.frames(detector, len(decisions)))
+        started, ended, forced, audio = detector.feed(
+            self.frames(detector, len(decisions))
+        )
 
         self.assertTrue(started)
         self.assertTrue(ended)
         self.assertFalse(forced)
+        self.assertTrue(audio)
         self.assertFalse(detector.speech_active)
 
     def test_forces_end_for_never_ending_noise(self):
         decisions = [True] * 8
         detector = self.make_detector(decisions, max_turn_seconds=0.10)
 
-        started, ended, forced = detector.feed(self.frames(detector, len(decisions)))
+        started, ended, forced, audio = detector.feed(
+            self.frames(detector, len(decisions))
+        )
 
         self.assertTrue(started)
         self.assertTrue(ended)
         self.assertTrue(forced)
+        self.assertTrue(audio)
 
 
-class AudioStreamEndTests(unittest.IsolatedAsyncioTestCase):
-    async def test_sends_audio_stream_end_to_live_session(self):
+class ExplicitSpeechTurnTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sends_activity_start_audio_and_activity_end_in_order(self):
         loop = object.__new__(AudioLoop)
         loop.running = True
         loop.state = "active"
@@ -69,18 +78,21 @@ class AudioStreamEndTests(unittest.IsolatedAsyncioTestCase):
         loop._clear_out_queue_pressure = lambda: None
 
         class FakeSession:
-            audio_stream_end = None
+            calls = []
 
             async def send_realtime_input(self, **kwargs):
-                self.audio_stream_end = kwargs.get("audio_stream_end")
-                loop.running = False
+                self.calls.append(kwargs)
+                if "activity_end" in kwargs:
+                    loop.running = False
 
         loop.session = FakeSession()
-        await loop.out_queue.put({"kind": "audio_stream_end"})
+        await loop.out_queue.put({"kind": "speech_turn", "data": bytes(2048)})
 
         await loop.send_realtime()
 
-        self.assertTrue(loop.session.audio_stream_end)
+        self.assertIn("activity_start", loop.session.calls[0])
+        self.assertIn("audio", loop.session.calls[1])
+        self.assertIn("activity_end", loop.session.calls[-1])
 
 
 if __name__ == "__main__":

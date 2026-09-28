@@ -62,7 +62,7 @@ HYBRID_VAD_END_SECONDS = 0.8
 HYBRID_VAD_MAX_TURN_SECONDS = 30.0
 HYBRID_VAD_START_SPEECH_RATIO = 0.60
 HYBRID_VAD_END_SPEECH_RATIO = 0.20
-HYBRID_VAD_RESPONSE_WAIT_SECONDS = 10.0
+CLIENT_TURN_RESPONSE_WAIT_SECONDS = 10.0
 VOICE_COMMAND_ECHO_GRACE_SECONDS = 2.0
 WAKE_COMMAND_MIN_CONFIDENCE = 0.80
 WAKE_COMMAND_MIN_RMS = 45.0
@@ -140,29 +140,17 @@ client = None
 client_connection_options = None
 
 
-def build_live_config(enable_search=False, automatic_vad=True):
+def build_live_config(enable_search=False):
     tools = None
     if enable_search:
         tools = [{"google_search": {}}]
 
-    if automatic_vad:
-        realtime_input_config = types.RealtimeInputConfig(
-            automatic_activity_detection=types.AutomaticActivityDetection(
-                disabled=False,
-                start_of_speech_sensitivity="START_SENSITIVITY_LOW",
-                end_of_speech_sensitivity="END_SENSITIVITY_HIGH",
-                prefix_padding_ms=300,
-                silence_duration_ms=800,
-            ),
-            turn_coverage="TURN_INCLUDES_ONLY_ACTIVITY",
-        )
-    else:
-        realtime_input_config = types.RealtimeInputConfig(
-            automatic_activity_detection=types.AutomaticActivityDetection(
-                disabled=True
-            ),
-            turn_coverage="TURN_INCLUDES_ALL_INPUT",
-        )
+    realtime_input_config = types.RealtimeInputConfig(
+        automatic_activity_detection=types.AutomaticActivityDetection(
+            disabled=True
+        ),
+        turn_coverage="TURN_INCLUDES_ALL_INPUT",
+    )
 
     return types.LiveConnectConfig(
         response_modalities=["AUDIO"],
@@ -738,6 +726,7 @@ class HybridTurnDetector:
         self.vad = vad or webrtcvad.Vad(aggressiveness)
         self._pcm_buffer = bytearray()
         self._start_window = deque(maxlen=self.start_window_frames)
+        self._start_audio = deque(maxlen=self.start_window_frames)
         self._end_window = deque(maxlen=self.end_window_frames)
         self.speech_active = False
         self._turn_frames = 0
@@ -745,16 +734,18 @@ class HybridTurnDetector:
     def reset(self):
         self._pcm_buffer.clear()
         self._start_window.clear()
+        self._start_audio.clear()
         self._end_window.clear()
         self.speech_active = False
         self._turn_frames = 0
 
     def feed(self, pcm_bytes):
-        """Return (speech_started, speech_ended, forced_end)."""
+        """Return (speech_started, speech_ended, forced_end, detected_audio)."""
         self._pcm_buffer.extend(pcm_bytes)
         speech_started = False
         speech_ended = False
         forced_end = False
+        detected_audio = bytearray()
 
         while len(self._pcm_buffer) >= self.frame_bytes:
             frame = bytes(self._pcm_buffer[: self.frame_bytes])
@@ -763,6 +754,7 @@ class HybridTurnDetector:
 
             if not self.speech_active:
                 self._start_window.append(is_speech)
+                self._start_audio.append(frame)
                 if (
                     len(self._start_window) == self.start_window_frames
                     and sum(self._start_window) / len(self._start_window)
@@ -772,8 +764,11 @@ class HybridTurnDetector:
                     self._turn_frames = 0
                     self._end_window.clear()
                     speech_started = True
+                    detected_audio.extend(b"".join(self._start_audio))
+                    self._start_audio.clear()
                 continue
 
+            detected_audio.extend(frame)
             self._turn_frames += 1
             self._end_window.append(is_speech)
             reached_maximum = self._turn_frames >= self.max_turn_frames
@@ -790,7 +785,7 @@ class HybridTurnDetector:
             self.reset()
             break
 
-        return speech_started, speech_ended, forced_end
+        return speech_started, speech_ended, forced_end, bytes(detected_audio)
 
 
 class AudioLoop:
@@ -860,10 +855,7 @@ class AudioLoop:
         self.no_auto_start_wake_word = normalize_phrase(no_auto_start_wake_word or "")
         self.prompt_scenarios = load_prompt_scenarios()
         self.daily_prompt = select_daily_prompt(self.prompt_scenarios)
-        self.live_config = build_live_config(
-            enable_search=self.enable_search,
-            automatic_vad=self.automatic_vad,
-        )
+        self.live_config = build_live_config(enable_search=self.enable_search)
 
         self.logger = configure_logging()
         self._daily_practice_completed_date = load_daily_practice_date(
@@ -918,7 +910,8 @@ class AudioLoop:
         self._session_active_started_at = 0.0
         self._session_user_responded = False
         self._awaiting_model_response = False
-        self._audio_stream_end_sent_at = 0.0
+        self._turn_end_sent_at = 0.0
+        self._client_turn_audio = bytearray()
         self._stdin_reader = None
         self._stdin_read_transport = None
         self.local_output_active = False
@@ -1301,8 +1294,10 @@ class AudioLoop:
 
                 await asyncio.sleep(1.0)
 
-                if self.out_queue is not None and not (
-                    self.strict_turns and self.assistant_speaking
+                if (
+                    self.out_queue is not None
+                    and not self._awaiting_model_response
+                    and not (self.strict_turns and self.assistant_speaking)
                 ):
                     await self._enqueue_realtime_message(frame)
         finally:
@@ -1340,8 +1335,10 @@ class AudioLoop:
 
             await asyncio.sleep(1.0)
 
-            if self.out_queue is not None and not (
-                self.strict_turns and self.assistant_speaking
+            if (
+                self.out_queue is not None
+                and not self._awaiting_model_response
+                and not (self.strict_turns and self.assistant_speaking)
             ):
                 await self._enqueue_realtime_message(frame)
 
@@ -1370,6 +1367,33 @@ class AudioLoop:
                             ),
                             timeout=REALTIME_SEND_TIMEOUT_SECONDS,
                         )
+                    elif msg.get("kind") == "speech_turn":
+                        await asyncio.wait_for(
+                            self.session.send_realtime_input(
+                                activity_start=types.ActivityStart()
+                            ),
+                            timeout=REALTIME_SEND_TIMEOUT_SECONDS,
+                        )
+                        turn_audio = msg["data"]
+                        upload_chunk_bytes = CHUNK_SIZE * 8
+                        for offset in range(0, len(turn_audio), upload_chunk_bytes):
+                            await asyncio.wait_for(
+                                self.session.send_realtime_input(
+                                    audio=types.Blob(
+                                        data=turn_audio[
+                                            offset : offset + upload_chunk_bytes
+                                        ],
+                                        mime_type=f"audio/pcm;rate={SEND_SAMPLE_RATE}",
+                                    )
+                                ),
+                                timeout=REALTIME_SEND_TIMEOUT_SECONDS,
+                            )
+                        await asyncio.wait_for(
+                            self.session.send_realtime_input(
+                                activity_end=types.ActivityEnd()
+                            ),
+                            timeout=REALTIME_SEND_TIMEOUT_SECONDS,
+                        )
                     elif msg.get("kind") == "activity_start":
                         await asyncio.wait_for(
                             self.session.send_realtime_input(
@@ -1382,11 +1406,6 @@ class AudioLoop:
                             self.session.send_realtime_input(
                                 activity_end=types.ActivityEnd()
                             ),
-                            timeout=REALTIME_SEND_TIMEOUT_SECONDS,
-                        )
-                    elif msg.get("kind") == "audio_stream_end":
-                        await asyncio.wait_for(
-                            self.session.send_realtime_input(audio_stream_end=True),
                             timeout=REALTIME_SEND_TIMEOUT_SECONDS,
                         )
                     elif msg.get("kind") == "video":
@@ -1430,7 +1449,8 @@ class AudioLoop:
                     server_content = getattr(response, "server_content", None)
                     if server_content and server_content.model_turn:
                         self._awaiting_model_response = False
-                        self._audio_stream_end_sent_at = 0.0
+                        self._turn_end_sent_at = 0.0
+                        self._client_turn_audio.clear()
                         if self.hybrid_turn_detector is not None:
                             self.hybrid_turn_detector.reset()
                     if self._debug_every("_last_receive_chunk_log", 2.0):
@@ -1447,7 +1467,8 @@ class AudioLoop:
 
                 self._status("Gemini turn complete")
                 self._awaiting_model_response = False
-                self._audio_stream_end_sent_at = 0.0
+                self._turn_end_sent_at = 0.0
+                self._client_turn_audio.clear()
                 if self.hybrid_turn_detector is not None:
                     self.hybrid_turn_detector.reset()
 
@@ -1598,27 +1619,29 @@ class AudioLoop:
                 now = self._loop_time()
                 if self.automatic_vad:
                     if self._awaiting_model_response:
-                        wait_seconds = now - self._audio_stream_end_sent_at
-                        if wait_seconds < HYBRID_VAD_RESPONSE_WAIT_SECONDS:
+                        wait_seconds = now - self._turn_end_sent_at
+                        if wait_seconds < CLIENT_TURN_RESPONSE_WAIT_SECONDS:
                             continue
                         self._status(
-                            "no Gemini response after local audio stream end; "
-                            "reopening microphone stream",
+                            "no Gemini response after explicit client turn; "
+                            "listening for a new turn",
                             level="warning",
                         )
                         self._awaiting_model_response = False
-                        self._audio_stream_end_sent_at = 0.0
+                        self._turn_end_sent_at = 0.0
+                        self._client_turn_audio.clear()
                         self.hybrid_turn_detector.reset()
 
-                    speech_started, speech_ended, forced_end = (
+                    speech_started, speech_ended, forced_end, detected_audio = (
                         self.hybrid_turn_detector.feed(data)
                     )
                     if speech_started:
+                        self._client_turn_audio.clear()
                         self.user_activity_active = True
                         self._user_activity_started_at = now
                         self._status(
-                            "client speech detector started; "
-                            "Gemini automatic VAD remains primary"
+                            "client WebRTC speech detector started; "
+                            "buffering explicit Gemini turn"
                         )
                         self._mark_session_user_response("voice")
                         if (
@@ -1632,28 +1655,28 @@ class AudioLoop:
                                 "user response detected for scheduled session"
                             )
 
-                    await self._enqueue_realtime_message(
-                        {
-                            "kind": "audio",
-                            "data": data,
-                            "mime_type": f"audio/pcm;rate={SEND_SAMPLE_RATE}",
-                        }
-                    )
+                    if detected_audio:
+                        self._client_turn_audio.extend(detected_audio)
 
                     if speech_ended:
                         duration = max(0.0, now - self._user_activity_started_at)
                         reason = "maximum turn length" if forced_end else "speech pause"
                         self.user_activity_active = False
                         self._user_activity_started_at = 0.0
+                        turn_audio = bytes(self._client_turn_audio)
+                        self._client_turn_audio.clear()
                         self._status(
-                            f"client speech detector ended; duration={duration:.1f}s; "
-                            f"reason={reason}; sending audio_stream_end"
+                            f"client WebRTC speech detector ended; "
+                            f"duration={duration:.1f}s; reason={reason}; "
+                            "sending explicit activity_start/audio/activity_end"
                         )
-                        if await self._enqueue_realtime_message(
-                            {"kind": "audio_stream_end"}
+                        self._awaiting_model_response = True
+                        self._turn_end_sent_at = now
+                        if not await self._enqueue_realtime_message(
+                            {"kind": "speech_turn", "data": turn_audio}
                         ):
-                            self._awaiting_model_response = True
-                            self._audio_stream_end_sent_at = now
+                            self._awaiting_model_response = False
+                            self._turn_end_sent_at = 0.0
                     continue
 
                 if not self.user_activity_active and rms >= self.vad_start_rms:
@@ -2024,7 +2047,8 @@ class AudioLoop:
         self.user_activity_active = False
         self._user_activity_started_at = 0.0
         self._awaiting_model_response = False
-        self._audio_stream_end_sent_at = 0.0
+        self._turn_end_sent_at = 0.0
+        self._client_turn_audio.clear()
         if self.hybrid_turn_detector is not None:
             self.hybrid_turn_detector.reset()
         self.audio_in_queue = None
@@ -2050,7 +2074,8 @@ class AudioLoop:
         self._session_active_started_at = 0.0
         self._session_user_responded = False
         self._awaiting_model_response = False
-        self._audio_stream_end_sent_at = 0.0
+        self._turn_end_sent_at = 0.0
+        self._client_turn_audio.clear()
         if self.hybrid_turn_detector is not None:
             self.hybrid_turn_detector.reset()
         self._set_state("connecting")
@@ -2064,7 +2089,7 @@ class AudioLoop:
             f"session_mode={session_mode}; "
             f"send_opening_prompt={opening_prompt is not None}; "
             f"search_enabled={self.enable_search}; "
-            f"vad={'Gemini-auto+client-end' if self.automatic_vad else 'local-manual'}; "
+            f"vad={'client-webrtc-explicit' if self.automatic_vad else 'local-rms-explicit'}; "
             f"open_timeout={self.live_open_timeout:.0f}s"
         )
         self.session_stop_event = asyncio.Event()
@@ -2169,7 +2194,8 @@ class AudioLoop:
         self._user_activity_started_at = 0.0
         self._last_user_voice_at = 0.0
         self._awaiting_model_response = False
-        self._audio_stream_end_sent_at = 0.0
+        self._turn_end_sent_at = 0.0
+        self._client_turn_audio.clear()
         if self.hybrid_turn_detector is not None:
             self.hybrid_turn_detector.reset()
         self._clear_out_queue_pressure()
@@ -2493,13 +2519,16 @@ if __name__ == "__main__":
         dest="automatic_vad",
         action="store_true",
         default=True,
-        help="Let Gemini automatically detect speech start and end (default).",
+        help=(
+            "Automatically detect speech locally with WebRTC VAD and send "
+            "explicit turn boundaries (default)."
+        ),
     )
     vad_mode_group.add_argument(
         "--manual-vad",
         dest="automatic_vad",
         action="store_false",
-        help="Use local RMS thresholds and send explicit activity signals.",
+        help="Use fixed local RMS thresholds and explicit turn boundaries.",
     )
     parser.add_argument(
         "--vad-start-rms",
