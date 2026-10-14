@@ -46,6 +46,21 @@ uv run python speak.py --wake-word "gemini" --mimic-wake-word "copy mode" --exit
 uv run python speak.py --no-auto-start --no-auto-start-wake-word "start talking" --wake-word "gemini" --exit-word "see you" --stt-model-path "./vosk-model-small-en-us-0.15" --mic-index 4 --strict-turns --mode none
 ```
 
+### Windows launcher with automatic recovery
+
+On Windows, double-click `start_speak.cmd` instead of keeping a manually typed
+PowerShell command open. It starts Speak with the recommended hands-free
+settings, keeps the console window open, and restarts the Python process after
+an unexpected non-zero exit. Normal `q`/Ctrl+C shutdowns are not restarted.
+Launcher exits are recorded in `logs/launcher.log`.
+
+The launcher uses the Windows default input device instead of a fixed microphone
+index. To override it from PowerShell, pass additional arguments:
+
+```powershell
+.\start_speak.ps1 -MicIndex 1
+```
+
 ### hourly afternoon conversations
 
 While the app is running, it automatically starts the normal daily-prompt
