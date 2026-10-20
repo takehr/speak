@@ -20,7 +20,7 @@ New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
 $launcherLog = Join-Path $logDirectory "launcher.log"
 
 $speakArguments = @(
-    "run", "python", "speak.py",
+    "run", "python", "-u", "-X", "faulthandler", "speak.py",
     "--no-auto-start",
     "--wake-word", "gemini",
     "--no-auto-start-wake-word", "hello",

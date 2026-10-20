@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import contextlib
 import datetime as dt
+import faulthandler
 import io
 import json
 import logging
@@ -24,6 +25,7 @@ import subprocess
 import sys
 import traceback
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -255,6 +257,19 @@ def configure_logging():
     logger.addHandler(handler)
     logger.propagate = False
     return logger
+
+
+def configure_crash_logging():
+    """Keep this file open for the lifetime of faulthandler."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    crash_log = (LOG_DIR / "native-crash.log").open("a", encoding="utf-8")
+    crash_log.write(
+        f"\n{dt.datetime.now().isoformat()} pid={os.getpid()} "
+        f"python={sys.version}\n"
+    )
+    crash_log.flush()
+    faulthandler.enable(file=crash_log, all_threads=True)
+    return crash_log
 
 
 def load_prompt_scenarios(prompts_dir=PROMPTS_DIR):
@@ -1499,14 +1514,28 @@ class AudioLoop:
 
     async def play_audio(self):
         self._status("opening local speaker stream")
-        stream = await asyncio.to_thread(
-            pya.open,
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=RECEIVE_SAMPLE_RATE,
-            output=True,
-        )
+        # Cancelling an await does not stop a native call already running in a
+        # thread. Serialize open/write/close so close cannot race with write,
+        # including cancellation while the device is still being opened.
+        worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="speaker")
+        event_loop = asyncio.get_running_loop()
+        stream = None
+
+        def open_stream():
+            nonlocal stream
+            stream = pya.open(
+                format=FORMAT,
+                channels=CHANNELS,
+                rate=RECEIVE_SAMPLE_RATE,
+                output=True,
+            )
+
+        def close_stream():
+            if stream is not None:
+                stream.close()
+
         try:
+            await event_loop.run_in_executor(worker, open_stream)
             while self.running and self.state == "active":
                 if self.audio_in_queue is None:
                     await asyncio.sleep(0.01)
@@ -1515,7 +1544,7 @@ class AudioLoop:
                 if self._debug_every("_last_audio_play_log", 2.0):
                     pending = self.audio_in_queue.qsize() if self.audio_in_queue is not None else 0
                     self._status(f"playing model audio locally; pending_audio_chunks={pending}")
-                await asyncio.to_thread(stream.write, bytestream)
+                await event_loop.run_in_executor(worker, stream.write, bytestream)
                 if (
                     self.audio_in_queue is not None
                     and self.audio_in_queue.empty()
@@ -1524,7 +1553,12 @@ class AudioLoop:
                     self.assistant_speaking = False
         finally:
             self._status("closing local speaker stream")
-            await asyncio.to_thread(stream.close)
+            try:
+                # Shield keeps a second cancellation from removing the queued
+                # close operation before the native write has finished.
+                await asyncio.shield(event_loop.run_in_executor(worker, close_stream))
+            finally:
+                worker.shutdown(wait=False)
 
     async def listen_microphone(self):
         if self.mic_index is None:
@@ -2327,6 +2361,9 @@ class AudioLoop:
 
 
 if __name__ == "__main__":
+    # A module-level reference keeps the fault-handler destination alive until
+    # process exit, even when asyncio is interrupted or restarted.
+    _crash_log = configure_crash_logging()
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode",

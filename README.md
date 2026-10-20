@@ -53,6 +53,12 @@ PowerShell command open. It starts Speak with the recommended hands-free
 settings, keeps the console window open, and restarts the Python process after
 an unexpected non-zero exit. Normal `q`/Ctrl+C shutdowns are not restarted.
 Launcher exits are recorded in `logs/launcher.log`.
+Native crash diagnostics (when Python can capture the fault) are appended to
+`logs/native-crash.log`. If the console suddenly returns to the command prompt
+without an `application stop` message, keep both logs and the daily log in
+`logs/` for diagnosis. Use `start_speak.cmd` to enable automatic recovery;
+running `uv run python speak.py ...` directly does not provide process-level
+restarts. The launcher also enables unbuffered output and early fault reporting.
 
 The launcher uses the Windows default input device instead of a fixed microphone
 index. To override it from PowerShell, pass additional arguments:
