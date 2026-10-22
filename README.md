@@ -155,6 +155,11 @@ server-side detector retaining the correct state. Short noises such as keyboard
 clicks are filtered without microphone-specific RMS tuning. The startup log
 shows `vad=client-webrtc-explicit` when this mode is active.
 
+With `--strict-turns`, microphone audio and voice commands are ignored until
+local Gemini playback finishes, followed by a 0.6-second echo grace period.
+Speak after that pause so the speaker output is not mistaken for your reply.
+Gemini is instructed to ask at most one question per turn and wait for your reply.
+
 For troubleshooting, `--manual-vad` switches back to local RMS-based activity
 signals. In that mode, `--vad-start-rms`, `--vad-end-rms`, and
 `--vad-silence-seconds` control the thresholds.

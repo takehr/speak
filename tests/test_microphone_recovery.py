@@ -20,6 +20,7 @@ class MicrophoneRecoveryTests(unittest.IsolatedAsyncioTestCase):
         loop.audio_stream = None
         loop.detector = FakeDetector()
         loop._status = lambda *_args, **_kwargs: None
+        loop._voice_commands_suppressed = lambda: False
         return loop
 
     async def test_retries_when_microphone_open_fails(self):

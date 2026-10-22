@@ -66,6 +66,7 @@ HYBRID_VAD_START_SPEECH_RATIO = 0.60
 HYBRID_VAD_END_SPEECH_RATIO = 0.20
 CLIENT_TURN_RESPONSE_WAIT_SECONDS = 10.0
 VOICE_COMMAND_ECHO_GRACE_SECONDS = 2.0
+MODEL_AUDIO_ECHO_GRACE_SECONDS = 0.6
 WAKE_COMMAND_MIN_CONFIDENCE = 0.80
 WAKE_COMMAND_MIN_RMS = 45.0
 WAKE_COMMAND_MIN_ACTIVE_SECONDS = 0.25
@@ -168,7 +169,11 @@ def build_live_config(enable_search=False):
             sliding_window=types.SlidingWindow(target_tokens=12800),
         ),
         system_instruction=(
-            "Follow the user's roleplay setup. Keep responses natural and conversational."
+            "Follow the user's roleplay setup. Keep responses natural and conversational. "
+            "Keep each turn brief. Ask at most one question at a time, then stop "
+            "and wait for the user's actual reply before continuing the scenario. "
+            "Never invent or speak the user's replies. Silence, background noise, "
+            "and echoes of your own speech are not user replies."
         ),
         tools=tools,
     )
@@ -903,6 +908,8 @@ class AudioLoop:
         self.input_task = None
         self.assistant_speaking = False
         self.assistant_audio_streaming = False
+        self._speaker_write_active = False
+        self._model_audio_suppressed_until = 0.0
         self.user_activity_active = False
         self._user_activity_started_at = 0.0
         self._last_user_voice_at = 0.0
@@ -1003,7 +1010,27 @@ class AudioLoop:
         return (
             self.local_output_active
             or self._loop_time() < self._voice_commands_suppressed_until
+            or (
+                self.strict_turns
+                and (
+                    self.assistant_speaking
+                    or self._loop_time() < self._model_audio_suppressed_until
+                )
+            )
         )
+
+    def _finish_assistant_audio_if_idle(self):
+        if (
+            self.assistant_audio_streaming
+            or self._speaker_write_active
+            or (self.audio_in_queue is not None and not self.audio_in_queue.empty())
+        ):
+            return
+        if self.assistant_speaking:
+            self.assistant_speaking = False
+            self._model_audio_suppressed_until = (
+                self._loop_time() + MODEL_AUDIO_ECHO_GRACE_SECONDS
+            )
 
     def _mark_out_queue_pressure(self):
         if self._out_queue_pressure_since is None:
@@ -1503,9 +1530,7 @@ class AudioLoop:
                 if not self.strict_turns and self.audio_in_queue is not None:
                     while not self.audio_in_queue.empty():
                         self.audio_in_queue.get_nowait()
-                    self.assistant_speaking = False
-                elif self.audio_in_queue is None or self.audio_in_queue.empty():
-                    self.assistant_speaking = False
+                self._finish_assistant_audio_if_idle()
         except Exception as exc:
             if self._is_normal_session_close(exc):
                 self.logger.info("receive_audio closed normally: %s", exc)
@@ -1544,13 +1569,10 @@ class AudioLoop:
                 if self._debug_every("_last_audio_play_log", 2.0):
                     pending = self.audio_in_queue.qsize() if self.audio_in_queue is not None else 0
                     self._status(f"playing model audio locally; pending_audio_chunks={pending}")
+                self._speaker_write_active = True
                 await event_loop.run_in_executor(worker, stream.write, bytestream)
-                if (
-                    self.audio_in_queue is not None
-                    and self.audio_in_queue.empty()
-                    and not self.assistant_audio_streaming
-                ):
-                    self.assistant_speaking = False
+                self._speaker_write_active = False
+                self._finish_assistant_audio_if_idle()
         finally:
             self._status("closing local speaker stream")
             try:
@@ -1559,6 +1581,7 @@ class AudioLoop:
                 await asyncio.shield(event_loop.run_in_executor(worker, close_stream))
             finally:
                 worker.shutdown(wait=False)
+                self._speaker_write_active = False
 
     async def listen_microphone(self):
         if self.mic_index is None:
@@ -1592,6 +1615,9 @@ class AudioLoop:
                     continue
                 self._status("microphone stream opened")
 
+            # A read may straddle the end of playback/the echo grace period.
+            # Discard that entire chunk, even if input is allowed when it returns.
+            microphone_suppressed = self._voice_commands_suppressed()
             try:
                 data = await asyncio.to_thread(
                     self.audio_stream.read,
@@ -1616,7 +1642,10 @@ class AudioLoop:
                     f"microphone loop alive; state={self.state}; detector={detector_state}; rms={rms:.0f}"
                 )
 
-            if self._voice_commands_suppressed():
+            microphone_suppressed = (
+                microphone_suppressed or self._voice_commands_suppressed()
+            )
+            if microphone_suppressed:
                 self.detector.reset()
                 command = None
             else:
@@ -1647,7 +1676,7 @@ class AudioLoop:
             can_stream_audio = (
                 self.out_queue is not None
                 and self.state == "active"
-                and not (self.strict_turns and self.assistant_speaking)
+                and not microphone_suppressed
             )
             if can_stream_audio:
                 now = self._loop_time()
@@ -1764,7 +1793,8 @@ class AudioLoop:
             if self.user_activity_active:
                 self.user_activity_active = False
                 self._user_activity_started_at = 0.0
-            if self.hybrid_turn_detector is not None and self.assistant_speaking:
+            self._client_turn_audio.clear()
+            if self.hybrid_turn_detector is not None:
                 self.hybrid_turn_detector.reset()
 
             if (
@@ -1775,7 +1805,7 @@ class AudioLoop:
                 and self._debug_every("_last_suppressed_speech_log", 2.0)
             ):
                 self._status(
-                    "user speech detected while Gemini audio is playing; "
+                    "microphone audio detected while Gemini audio is playing; "
                     "not sending because --strict-turns is enabled",
                     level="warning",
                 )
@@ -2078,6 +2108,8 @@ class AudioLoop:
 
         self.assistant_speaking = False
         self.assistant_audio_streaming = False
+        self._speaker_write_active = False
+        self._model_audio_suppressed_until = 0.0
         self.user_activity_active = False
         self._user_activity_started_at = 0.0
         self._awaiting_model_response = False
@@ -2224,6 +2256,8 @@ class AudioLoop:
         self.input_task = None
         self.assistant_speaking = False
         self.assistant_audio_streaming = False
+        self._speaker_write_active = False
+        self._model_audio_suppressed_until = 0.0
         self.user_activity_active = False
         self._user_activity_started_at = 0.0
         self._last_user_voice_at = 0.0

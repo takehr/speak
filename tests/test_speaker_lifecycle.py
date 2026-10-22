@@ -14,6 +14,9 @@ class SpeakerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         loop.audio_in_queue = asyncio.Queue()
         loop.audio_in_queue.put_nowait(b"\0\0" * 16)
         loop.assistant_audio_streaming = True
+        loop.assistant_speaking = True
+        loop._speaker_write_active = False
+        loop._model_audio_suppressed_until = 0.0
         loop._status = lambda *_args, **_kwargs: None
         loop._debug_every = lambda *_args: False
         return loop
