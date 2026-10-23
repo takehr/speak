@@ -23,7 +23,7 @@ $speakArguments = @(
     "run", "python", "-u", "-X", "faulthandler", "speak.py",
     "--no-auto-start",
     "--wake-word", "gemini",
-    "--no-auto-start-wake-word", "hello",
+    "--no-auto-start-wake-word", "start talking",
     "--exit-word", "hello",
     "--mimic-wake-word", "copy mode",
     "--translate-wake-word", "translate",

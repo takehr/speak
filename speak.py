@@ -70,6 +70,9 @@ MODEL_AUDIO_ECHO_GRACE_SECONDS = 0.6
 WAKE_COMMAND_MIN_CONFIDENCE = 0.80
 WAKE_COMMAND_MIN_RMS = 45.0
 WAKE_COMMAND_MIN_ACTIVE_SECONDS = 0.25
+WAKE_NOISE_WINDOW_SECONDS = 3.0
+WAKE_NOISE_CALIBRATION_SECONDS = 0.5
+WAKE_NOISE_RATIO = 2.5
 DEFAULT_DAILY_START_TIMES = tuple(dt.time(hour=hour) for hour in range(13, 21))
 DEFAULT_SCHEDULED_RESPONSE_TIMEOUT_SECONDS = 60.0
 DEFAULT_DAILY_PRACTICE_MIN_SECONDS = 60.0
@@ -551,6 +554,11 @@ class LocalCommandDetector:
         self.wake_min_confidence = wake_min_confidence
         self.wake_min_rms = wake_min_rms
         self.wake_min_active_seconds = wake_min_active_seconds
+        self._wake_noise_samples = deque(
+            maxlen=math.ceil(WAKE_NOISE_WINDOW_SECONDS * SEND_SAMPLE_RATE / CHUNK_SIZE)
+        )
+        self._wake_observed_seconds = 0.0
+        self._wake_effective_rms = wake_min_rms
         self._wake_active_run_seconds = 0.0
         self._wake_max_active_seconds = 0.0
         self.last_trigger_at = {
@@ -589,7 +597,19 @@ class LocalCommandDetector:
 
     def _observe_wake_activity(self, pcm_bytes, rms):
         frame_seconds = (len(pcm_bytes) // 2) / SEND_SAMPLE_RATE
-        if rms >= self.wake_min_rms:
+        if frame_seconds <= 0:
+            return
+        # The lower fifth of recent idle audio estimates the ambient floor;
+        # brief speech/noise peaks should not immediately raise that floor.
+        self._wake_noise_samples.append(rms)
+        self._wake_observed_seconds += frame_seconds
+        levels = sorted(self._wake_noise_samples)
+        noise_floor = levels[int((len(levels) - 1) * 0.2)]
+        self._wake_effective_rms = max(self.wake_min_rms, noise_floor * WAKE_NOISE_RATIO)
+        if self._wake_observed_seconds < WAKE_NOISE_CALIBRATION_SECONDS:
+            self._reset_wake_activity()
+            return
+        if rms >= self._wake_effective_rms:
             self._wake_active_run_seconds += frame_seconds
             self._wake_max_active_seconds = max(
                 self._wake_max_active_seconds,
@@ -665,6 +685,10 @@ class LocalCommandDetector:
             if command in self.WAKE_COMMANDS:
                 if not is_final:
                     continue
+                # Require an intentional standalone command, not a word buried
+                # in unrelated speech or a long noisy recognition result.
+                if text != phrase:
+                    continue
                 if not self._phrase_confident_enough(phrase, words):
                     self.logger.info(
                         "Ignored low-confidence %s phrase from transcript=%r",
@@ -687,7 +711,8 @@ class LocalCommandDetector:
         return None
 
     def feed(self, pcm_bytes, state=None, rms=0.0):
-        self._observe_wake_activity(pcm_bytes, rms)
+        if state in {"idle", None}:
+            self._observe_wake_activity(pcm_bytes, rms)
         payloads = []
         if self.recognizer.AcceptWaveform(pcm_bytes):
             payloads.append(self.recognizer.Result())
@@ -708,10 +733,13 @@ class LocalCommandDetector:
                 continue
             result_type = "final" if is_final else "partial"
             self.logger.info(
-                "Detected %s phrase from %s transcript=%r",
+                "Detected %s phrase from %s transcript=%r; "
+                "active_audio=%.3fs wake_rms_threshold=%.0f",
                 command,
                 result_type,
                 text,
+                self._wake_max_active_seconds,
+                self._wake_effective_rms,
             )
             self.reset()
             return command
@@ -2481,8 +2509,8 @@ if __name__ == "__main__":
         type=float,
         default=WAKE_COMMAND_MIN_RMS,
         help=(
-            "Minimum RMS counted as wake-phrase audio. "
-            "Raise it to reject quiet background noise."
+            "Minimum RMS floor counted as wake-phrase audio. "
+            "The actual threshold also adapts to ambient idle noise."
         ),
     )
     parser.add_argument(

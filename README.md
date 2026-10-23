@@ -53,6 +53,9 @@ PowerShell command open. It starts Speak with the recommended hands-free
 settings, keeps the console window open, and restarts the Python process after
 an unexpected non-zero exit. Normal `q`/Ctrl+C shutdowns are not restarted.
 Launcher exits are recorded in `logs/launcher.log`.
+The Windows launcher uses `gemini` to start today's prompt and `start talking`
+to connect without an opening prompt. The previous `hello` idle trigger has
+been removed to reduce false starts; `hello` still ends an active session.
 Native crash diagnostics (when Python can capture the fault) are appended to
 `logs/native-crash.log`. If the console suddenly returns to the command prompt
 without an `application stop` message, keep both logs and the daily log in
@@ -118,11 +121,18 @@ The timeout and retry behavior can also be adjusted with
 
 `--wake-min-confidence` controls how confident Vosk must be before an idle wake
 phrase is accepted. The default is `0.80`; try `0.85` or higher if the app
-starts without you saying the wake word. Wake phrases also require `0.25`
-seconds of continuous audio above `--wake-min-rms 45` by default, which rejects
-short impact sounds such as keyboard clicks. If clicks still trigger it, try
-`--wake-min-active-seconds 0.30`. If softly spoken wake phrases are missed,
-lower `--wake-min-rms` or `--wake-min-active-seconds`.
+starts without you saying the wake word. Say the configured phrase on its own:
+only a final recognition result matching the whole phrase is accepted.
+Wake phrases also require `0.25` seconds of continuous audio above an adaptive
+RMS threshold. After an initial 0.5 seconds of calibration, the threshold is the
+higher of `--wake-min-rms 45` and 2.5 times the lower fifth of recent idle RMS
+samples (about 3 seconds). This prevents steady background noise above 45 from
+counting as sustained wake speech. Short impact sounds are also filtered by
+the duration requirement; use `--wake-min-active-seconds 0.30` for stricter
+filtering. Lowering `--wake-min-rms` cannot override the ambient-noise threshold.
+Accepted detections, their recognized text, and the threshold are recorded in
+the daily log under `logs/`. These filters reduce false starts but cannot
+guarantee that speech recognition never mistakes a sound for a wake phrase.
 
 By default the app uses `models/gemini-2.5-flash-native-audio-preview-12-2025`,
 because this project uses Google Search grounding in no-auto-start sessions.
