@@ -154,6 +154,15 @@ Current starter set:
 To add a new scenario, drop another markdown file into `./prompts`.
 The full markdown content is sent as the opening prompt when auto-start is enabled.
 
+English correction is also part of the shared system instructions, including
+free conversation started without an opening prompt. After an English reply,
+Gemini is instructed to correct one or two clear grammar or phrasing problems
+before continuing: say the corrected English sentence aloud, give a short
+Japanese explanation, then respond to the content in English. Natural, correct
+answers do not need forced corrections. Shadowing and translation modes keep
+their existing retry rules. This is model-directed behavior; actual correction
+quality still needs to be checked in a live conversation.
+
 ### sample for `--no-auto-start`
 When you start with `--no-auto-start`, Gemini connects without sending the first turn.
 In this mode, the Live session also enables the Google Search tool. Pass
